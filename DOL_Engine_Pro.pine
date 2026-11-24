@@ -32,7 +32,6 @@ iMinPoT    = input.float(0.0, "Min PoT to Show DOL (%)", minval = 0.0, maxval = 
 iMaxATR    = input.float(12.0, "Max Distance (× Engine B ATR)", minval = 1.0, step = 0.5, group = grpQ)
 iHorizon   = input.int(120, "PoT Horizon (chart bars)", minval = 10, maxval = 2000, group = grpQ)
 iMergeTol  = input.float(0.25, "Cross-TF Merge Tolerance (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpQ)
-iScoreBars = input.int(300, "Scored Bars (alerts / ghost history)", minval = 50, maxval = 3000, group = grpQ)
 
 grpS = "🕒 Sessions"
 iTz   = input.string("America/New_York", "Timezone", group = grpS)
@@ -78,6 +77,22 @@ iSmtMode = input.string("Bonus", "SMT Divergence", options = ["Off", "Bonus", "R
 iSmtLen  = input.int(30, "SMT Lookback (bars)", minval = 5, maxval = 200, group = grpSF)
 iConsPoT = input.bool(true, "Conservative PoT", group = grpSF,
      tooltip = "Ignores favourable drift, trims volatility 15 % and reduces it outside killzones → PoT is harder to inflate.")
+
+grpL = "🧠 Self-Learning (calibrates on your chart)"
+iLearnBars   = input.int(4000, "Learning Window (bars)", minval = 300, maxval = 20000, group = grpL,
+     tooltip = "History used to measure how often DOLs are reached and how signals perform. Lower it if the script is slow.")
+iSampleEvery = input.int(10, "DOL Sample Every (bars)", minval = 1, maxval = 120, group = grpL)
+iPrior       = input.int(10, "Calibration Prior Strength", minval = 1, maxval = 100, group = grpL,
+     tooltip = "How many real samples are needed before the measured hit rate outweighs the model PoT.")
+iThrMode     = input.string("Auto (learned)", "Confirmation Threshold", options = ["Fixed", "Auto (learned)"], group = grpL,
+     tooltip = "Auto: picks the lowest Confirmation level (70 / 80 / 90) whose measured hit rate reaches the target. Until there is enough data it uses the fixed value.")
+iTargetHit   = input.int(70, "Target DOL Hit Rate (%)", minval = 40, maxval = 95, group = grpL)
+iMinSamples  = input.int(20, "Min Samples per Level", minval = 5, maxval = 500, group = grpL)
+iMinConfs    = input.int(4, "Min Confirmations (of 7)", minval = 0, maxval = 7, group = grpL,
+     tooltip = "1H bias · 15m bias · 4H bias · order flow · clear path · cross-TF confluence · killzone")
+iSigAdaptive = input.bool(true, "Hide Signal Setups with Negative Expectancy", group = grpL)
+iMinSigSamp  = input.int(8, "Min Signals per Setup", minval = 3, maxval = 100, group = grpL)
+iShowStats   = input.bool(true, "Self-Stats Rows in HUD", group = grpL)
 
 grpH = "📊 HUD"
 iShowHud = input.bool(true, "Show HUD", group = grpH)
@@ -482,6 +497,8 @@ type Cand
     float  conv   = 0.0
     float  pot    = 0.0
     float  dist   = 0.0
+    float  cpot   = 0.0      // calibrated PoT (model blended with measured hit rate)
+    int    confs  = 0        // independent confirmations (of 7)
 
 f_edge(Cand c) =>
     c.dir == 1 ? c.btm : c.top
@@ -516,7 +533,7 @@ f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int t
 f_fvgDepth(float top, float btm, float a) =>
     math.min(18.0, 8.0 + 10.0 * (top - btm) / math.max(nz(a, atrRef), syminfo.mintick))
 
-doScore = last_bar_index - bar_index <= iScoreBars
+doScore = last_bar_index - bar_index <= iLearnBars
 tfAName = f_tfName(iTfA)
 tfBName = f_tfName(iTfB)
 
@@ -529,14 +546,14 @@ if doScore
     if runLoW > pwl
         f_add(cs, "PWL", "1W", pwl, pwl, pwt, 4, 22.0, false, tol)
     if runHiD < pdh
-        f_add(cs, "PDH", "1D", pdh, pdh, pdt, 3, 20.0, false, tol)
+        f_add(cs, "PDH", "1D", pdh, pdh, pdt, 3, 22.0, false, tol)
     if runLoD > pdl
-        f_add(cs, "PDL", "1D", pdl, pdl, pdt, 3, 20.0, false, tol)
+        f_add(cs, "PDL", "1D", pdl, pdl, pdt, 3, 22.0, false, tol)
     // sessions
     f_add(cs, "LON-H", "SES", lnH, lnH, lnHt, 2, 15.0, false, tol)
     f_add(cs, "LON-L", "SES", lnL, lnL, lnLt, 2, 15.0, false, tol)
-    f_add(cs, "ASIA-H", "SES", asH, asH, asHt, 2, 14.0, false, tol)
-    f_add(cs, "ASIA-L", "SES", asL, asL, asLt, 2, 14.0, false, tol)
+    f_add(cs, "ASIA-H", "SES", asH, asH, asHt, 2, 16.0, false, tol)
+    f_add(cs, "ASIA-L", "SES", asL, asL, asLt, 2, 16.0, false, tol)
     f_add(cs, "NY-H", "SES", nyH, nyH, nyHt, 2, 15.0, false, tol)
     f_add(cs, "NY-L", "SES", nyL, nyL, nyLt, 2, 15.0, false, tol)
     // engine A (major)
@@ -566,6 +583,34 @@ if doScore
     if runLoB > bDBtm
         f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol)
 
+// ──────────────────────────────────────────────── SELF-LEARNING MEMORY ──────
+// DOL samples: model-PoT decile (10) and Confirmation level (<60,60,70,80,90+)
+var array<int> pN = array.new<int>(10, 0)
+var array<int> pH = array.new<int>(10, 0)
+var array<int> kN = array.new<int>(5, 0)
+var array<int> kH = array.new<int>(5, 0)
+// signal outcomes by safety stars (0-5)
+var array<int>   gN = array.new<int>(6, 0)
+var array<int>   gW = array.new<int>(6, 0)
+var array<float> gR = array.new<float>(6, 0.0)
+
+f_pB(float pot) =>
+    math.max(0, math.min(9, int(pot / 10.0)))
+f_kB(float conv) =>
+    conv >= 90 ? 4 : conv >= 80 ? 3 : conv >= 70 ? 2 : conv >= 60 ? 1 : 0
+// Bayesian blend: model PoT acts as a prior worth iPrior samples
+f_calib(float pot) =>
+    int b = f_pB(pot)
+    math.min(95.0, 100.0 * (pH.get(b) + iPrior * pot / 100.0) / (pN.get(b) + iPrior))
+// measured hit rate for Confirmation ≥ level bucket b
+f_kRate(int b) =>
+    int n = 0
+    int h = 0
+    for j = b to 4
+        n += kN.get(j)
+        h += kH.get(j)
+    [n, n > 0 ? 100.0 * h / n : 0.0]
+
 // ─────────────────────────────────────────────────────────────── SCORING ────
 int nC = cs.size()
 array<float> convs = array.new<float>()
@@ -592,9 +637,29 @@ if nC > 0
             float sClear = math.max(0.0, 15.0 - 5.0 * nBlock)
             c.conv := math.min(100.0, sDepth + sAlign + sFlow + sProx + sClear)
             c.pot  := f_pot(math.abs(edge - close), c.dir)
+            c.cpot := f_calib(c.pot)
+            int cf = 0
+            cf += biasA == c.dir ? 1 : 0
+            cf += biasB == c.dir ? 1 : 0
+            cf += biasC == c.dir ? 1 : 0
+            cf += (c.dir == 1 ? flowPct >= 55 : flowPct <= 45) ? 1 : 0
+            cf += nBlock == 0 ? 1 : 0
+            cf += c.merged > 0 or c.tier >= 3 ? 1 : 0
+            cf += inKZ ? 1 : 0
+            c.confs := cf
         convs.push(c.conv)
 
 array<int> rankIdx = nC > 0 ? convs.sort_indices(order.descending) : array.new<int>()
+
+// learned Confirmation threshold
+int   effMinConv = iMinConv
+[n70, r70] = f_kRate(2)
+[n80, r80] = f_kRate(3)
+[n90, r90] = f_kRate(4)
+if iThrMode == "Auto (learned)" and n70 >= iMinSamples
+    effMinConv := r70 >= iTargetHit ? 70 : n80 >= iMinSamples and r80 >= iTargetHit ? 80 : 90
+gateN    = effMinConv >= 90 ? n90 : effMinConv >= 80 ? n80 : effMinConv >= 70 ? n70 : 0
+gateRate = effMinConv >= 90 ? r90 : effMinConv >= 80 ? r80 : effMinConv >= 70 ? r70 : 0.0
 
 int primI = -1
 int bestI = -1
@@ -602,9 +667,41 @@ if nC > 0
     bestI := rankIdx.get(0)
     for k = 0 to nC - 1
         Cand c = cs.get(rankIdx.get(k))
-        if c.conv >= iMinConv and c.pot >= iMinPoT and c.conv > 0
+        if c.conv >= effMinConv and c.cpot >= iMinPoT and c.confs >= iMinConfs and c.conv > 0
             primI := rankIdx.get(k)
             break
+
+// ─────────────────────────────────────── DOL SAMPLING (learn hit rates) ─────
+var array<float> smL = array.new<float>()
+var array<int>   smD = array.new<int>()
+var array<int>   smB = array.new<int>()
+var array<int>   smP = array.new<int>()
+var array<int>   smK = array.new<int>()
+if barstate.isconfirmed and doScore
+    if smL.size() > 0
+        for i = smL.size() - 1 to 0
+            bool hit = smD.get(i) == 1 ? high >= smL.get(i) : low <= smL.get(i)
+            if hit or bar_index - smB.get(i) >= iHorizon
+                int pb = smP.get(i)
+                int kb = smK.get(i)
+                pN.set(pb, pN.get(pb) + 1)
+                kN.set(kb, kN.get(kb) + 1)
+                if hit
+                    pH.set(pb, pH.get(pb) + 1)
+                    kH.set(kb, kH.get(kb) + 1)
+                smL.remove(i)
+                smD.remove(i)
+                smB.remove(i)
+                smP.remove(i)
+                smK.remove(i)
+    if bar_index % iSampleEvery == 0 and bestI >= 0
+        Cand sc = cs.get(bestI)
+        if sc.conv > 0
+            smL.push(f_edge(sc))
+            smD.push(sc.dir)
+            smB.push(bar_index)
+            smP.push(f_pB(sc.pot))
+            smK.push(f_kB(sc.conv))
 
 // ─────────────────────────────────────────────────────── EVENTS / GHOSTS ────
 var string primKey  = ""
@@ -676,6 +773,9 @@ var line   tLs    = na
 var line   tLt    = na
 var label  tLsL   = na
 var label  tLtL   = na
+var bool   tShown = false
+var int    tStars = 0
+var float  tRisk  = na
 
 bool  evBuy   = false
 bool  evSell  = false
@@ -709,10 +809,23 @@ if iShowSig and barstate.isconfirmed and doScore
         bool hitSL = tDir == 1 ? low <= tSL : high >= tSL
         bool flip  = activeDir != 0 and activeDir != tDir
         if hitTP or hitSL or flip
-            evTP    := hitTP
-            evSL    := hitSL and not hitTP
-            evInval := flip and not hitTP and not hitSL
+            // record outcome in R (SL and TP in the same bar counts as a loss)
+            float rRes = hitSL ? -1.0 : hitTP ? (tTP - tEntry) * tDir / tRisk : (close - tEntry) * tDir / tRisk
+            gN.set(tStars, gN.get(tStars) + 1)
+            if rRes > 0
+                gW.set(tStars, gW.get(tStars) + 1)
+            gR.set(tStars, gR.get(tStars) + rRes)
+            if tShown
+                evTP    := hitTP and not hitSL
+                evSL    := hitSL
+                evInval := flip and not hitTP and not hitSL
             f_clearTrade()
+            tLbl := na
+            tLe  := na
+            tLs  := na
+            tLt  := na
+            tLsL := na
+            tLtL := na
             tDir := 0
         else
             // TP follows the active DOL while it keeps the trade direction
@@ -771,14 +884,22 @@ if iShowSig and barstate.isconfirmed and doScore
             sigEntry := tEntry
             sigSL    := tSL
             sigTP    := tTP
-            evSell := sell
-            evBuy  := not sell
-            int safety = (inKZ ? 1 : 0) + (mssOk ? 1 : 0) + (dispOk ? 1 : 0) + (armPD ? 1 : 0) + (armSmt ? 1 : 0)
+            int  safety = (inKZ ? 1 : 0) + (mssOk ? 1 : 0) + (dispOk ? 1 : 0) + (armPD ? 1 : 0) + (armSmt ? 1 : 0)
+            int  nCfg   = gN.get(safety)
+            // every valid setup is tracked; it is only SHOWN if its measured expectancy is not negative
+            bool cfgOk  = not iSigAdaptive or nCfg < iMinSigSamp or gR.get(safety) / nCfg > 0
+            tShown := cfgOk
+            tStars := safety
+            tRisk  := risk
+            evSell := sell and tShown
+            evBuy  := not sell and tShown
+            string hist = nCfg >= iMinSigSamp ? " · " + str.tostring(100.0 * gW.get(safety) / nCfg, "#") + "% hist" : ""
             string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " → " + cs.get(primI).name + " · RR " + str.tostring(rr, "#.0") +
-                 " · ★" + str.tostring(safety) + "/5"
-            tLbl := label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
-                 color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace)
-            if iSigLines
+                 " · ★" + str.tostring(safety) + "/5" + hist
+            if tShown
+                tLbl := label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
+                     color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace)
+            if iSigLines and tShown
                 int x2 = bar_index + 10
                 tLe  := line.new(bar_index, tEntry, x2, tEntry, color = cAcc, width = 2)
                 tLs  := line.new(bar_index, tSL, x2, tSL, color = color.new(cBear, 10), style = line.style_dashed, width = 1)
@@ -835,7 +956,7 @@ if iShowMS and barstate.isconfirmed and last_bar_index - bar_index <= 1500
 var array<line>  dLines  = array.new<line>()
 var array<label> dLabels = array.new<label>()
 var array<box>   dBoxes  = array.new<box>()
-var table hud = table.new(f_pos(iHudPos), 2, 17, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
+var table hud = table.new(f_pos(iHudPos), 2, 19, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
 
 f_hud(int r, string l, string v, color lc, color vc, color bg) =>
     table.cell(hud, 0, r, l, text_color = lc, text_halign = text.align_left, text_size = hudSize, bgcolor = bg, text_font_family = font.family_monospace)
@@ -871,7 +992,7 @@ if barstate.islast
         dLabels.push(label.new(int(p.t + (xR - p.t) / 2), edge, "1. " + p.name + " · " + str.tostring(bars) + " bars", xloc = xloc.bar_time,
              style = label.style_label_center, color = cBg, textcolor = color.new(cAcc, 25), size = size.tiny, text_font_family = font.family_monospace))
         dLabels.push(label.new(xR, edge, "◆ " + f_grade(p.conv) + "  " + p.name + (p.merged > 0 ? "  ⊕" + str.tostring(p.merged) : "") + "\n" +
-             p.tf + "  " + str.tostring(p.pot, "#.0") + "%", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
+             p.tf + "  " + str.tostring(p.cpot, "#.0") + "%  ✓" + str.tostring(p.confs) + "/7", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
              textcolor = cAcc, size = size.small, textalign = text.align_left, text_font_family = font.family_monospace))
 
     // ── candidate ladder (runner-ups)
@@ -924,7 +1045,7 @@ if barstate.islast
 
     // ── HUD
     if iShowHud
-        table.clear(hud, 0, 0, 1, 16)
+        table.clear(hud, 0, 0, 1, 18)
         f_hud(0, "DOL ENGINE PRO", f_tfName(timeframe.period), cAcc, cMute, cBg)
         int   si   = primI >= 0 ? primI : bestI
         bool  live = primI >= 0
@@ -935,9 +1056,9 @@ if barstate.islast
             if live
                 f_hud(1, "◆ " + f_grade(s.conv) + "   " + s.name + " " + s.tf, str.tostring(edge, format.mintick), cAcc, cTxt, cRow)
             else
-                f_hud(1, "◇ WAITING ≥ " + str.tostring(iMinConv) + "%", "best " + s.name + " " + s.tf, cMute, cMute, cRow)
-            f_hud(2, "PoT " + str.tostring(iHorizon) + "b", f_bar(s.pot) + " " + str.tostring(s.pot, "#.0") + "%", cMute, vc, cBg)
-            f_hud(3, "Confirmation", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
+                f_hud(1, "◇ WAITING ≥ " + str.tostring(effMinConv) + "%", "best " + s.name + " " + s.tf, cMute, cMute, cRow)
+            f_hud(2, "PoT " + str.tostring(iHorizon) + "b", f_bar(s.cpot) + " " + str.tostring(s.cpot, "#.0") + "%", cMute, vc, cBg)
+            f_hud(3, "Confirm ≥" + str.tostring(effMinConv) + " ✓" + str.tostring(s.confs) + "/7", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
             f_hud(4, "Distance", str.tostring(s.dist, "#.##") + " × " + tfBName + " ATR " + (s.dir == 1 ? "↑" : "↓"), cMute, vc, cBg)
         else
             f_hud(1, "◇ NO TARGET", "in range", cMute, cMute, cRow)
@@ -968,10 +1089,22 @@ if barstate.islast
                 Cand c = cs.get(i)
                 if i != primI and c.conv > 0 and row <= 15
                     f_hud(row, str.tostring(row - 11) + ". " + c.name + " " + c.tf + (c.dir == 1 ? " ↑" : " ↓"),
-                         str.tostring(c.conv, "#") + " · " + str.tostring(c.pot, "#") + "%", cTxt, c.conv >= iMinConv ? cAcc : cMute, cBg)
+                         str.tostring(c.conv, "#") + " · " + str.tostring(c.cpot, "#") + "%", cTxt, c.conv >= iMinConv ? cAcc : cMute, cBg)
                     row += 1
+        if iShowStats
+            f_hud(16, "DOL hit ≥" + str.tostring(effMinConv) + (iThrMode == "Fixed" ? "" : " auto"),
+                 gateN > 0 ? str.tostring(gateRate, "#") + "% · n " + str.tostring(gateN) : "learning…", cMute, gateRate >= iTargetHit ? cAcc : cTxt, cBg)
+            int   sN = 0
+            int   sW = 0
+            float sR = 0.0
+            for j = 0 to 5
+                sN += gN.get(j)
+                sW += gW.get(j)
+                sR += gR.get(j)
+            f_hud(17, "Signals", sN > 0 ? str.tostring(100.0 * sW / sN, "#") + "% · " + str.tostring(sR / sN, "+#.##;-#.##") + "R · n " + str.tostring(sN) : "learning…",
+                 cMute, sR > 0 ? cAcc : sN > 0 ? cBear : cTxt, cBg)
         if timeframe.in_seconds(timeframe.period) > 60
-            f_hud(16, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
+            f_hud(18, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
 
 // ──────────────────────────────────────────────── ORDER-FLOW IMBALANCE ──────
 imbUp = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol >= 0.5
@@ -992,7 +1125,7 @@ alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure b
 if evNew and primI >= 0
     Cand p = cs.get(primI)
     alert("DOL Engine Pro · " + (p.dir == 1 ? "▲ " : "▼ ") + p.name + " " + p.tf + " @ " + str.tostring(f_edge(p), format.mintick) +
-         " · Confirmation " + str.tostring(p.conv, "#") + "% · PoT " + str.tostring(p.pot, "#.0") + "%", alert.freq_once_per_bar_close)
+         " · Confirmation " + str.tostring(p.conv, "#") + "% (" + str.tostring(p.confs) + "/7) · PoT " + str.tostring(p.cpot, "#.0") + "%", alert.freq_once_per_bar_close)
 if evBuy or evSell
     alert("DOL Engine Pro · " + (evSell ? "SELL" : "BUY") + " " + syminfo.ticker + " @ " + str.tostring(sigEntry, format.mintick) +
          " · SL " + str.tostring(sigSL, format.mintick) + " · TP " + str.tostring(sigTP, format.mintick), alert.freq_once_per_bar_close)

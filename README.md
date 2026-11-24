@@ -23,6 +23,23 @@ Diseñado para usarse en el **gráfico de 1 minuto**. Los objetivos de liquidez 
   - La etiqueta muestra `★n/5`: cuántas confluencias se cumplieron (killzone, MSS, desplazamiento, premium/discount, SMT).
 - Opcional: BOS / MSS en el gráfico y barras de desequilibrio de order flow.
 
+### 🧠 Auto-aprendizaje (retroalimentación)
+El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
+
+| Qué aprende | Cómo lo usa |
+|---|---|
+| Cada 10 velas registra el mejor objetivo y comprueba si el precio lo tocó dentro del horizonte del PoT | **PoT calibrado**: mezcla el modelo con la tasa de acierto real (bayesiano: el modelo cuenta como 10 muestras y luego mandan los datos) |
+| % de acierto por nivel de Confirmación (≥70, ≥80, ≥90) | **Umbral automático**: elige el nivel más bajo que alcanza el acierto objetivo (70%). Con pocos datos usa 80 y, si ninguno llega, 90 |
+| 7 confirmaciones independientes: sesgo 1H, sesgo 15m, sesgo 4H, order flow, camino libre, confluencia entre temporalidades, killzone | El DOL solo aparece con **≥ 4 de 7** confirmaciones (ajustable) |
+| Resultado en R de cada señal según sus estrellas (★0–5), aunque no se muestre | Las configuraciones con **expectativa negativa se ocultan** cuando hay ≥ 8 casos. La etiqueta muestra el % histórico |
+
+El HUD agrega 2 filas: `DOL hit ≥80 auto · 74% · n 120` y `Signals · 58% · +0.31R · n 12`.
+
+### 📚 Investigación usada
+- Los extremos del día anterior se alcanzan en ~90% de las sesiones de NQ, y el rango overnight se rompe ~94% de los días. Por eso se subió la profundidad de PDH/PDL y de las sesiones.
+- Las reversiones tras barrida con TP fijo a 2R ganaron entre 26% y 41% en un backtest independiente (sin ventaja), y la ventaja tras barrer el PDH es pequeña (46.9% frente a 43.6%). Por eso el TP es el DOL y no un R fijo, y las configuraciones se filtran por su expectativa medida.
+- Los % de acierto publicados por vendedores no son verificables. Por eso el indicador mide en **tu** activo.
+
 ### Confirmación (0–100)
 | Pilar | Peso | Lógica |
 |---|---|---|
