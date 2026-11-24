@@ -1,3 +1,30 @@
+# DOL Engine Pro · Draw on Liquidity (versión 1m)
+
+**Archivo:** [`DOL_Engine_Pro.pine`](./DOL_Engine_Pro.pine). Es la versión principal. El original `DOL_Engine.pine` se mantiene como v1.
+
+Diseñado para usarse en el **gráfico de 1 minuto**. Los objetivos de liquidez se calculan en **1H** y **15m**, además de los niveles diarios, semanales y de sesión. El DOL **solo aparece cuando la Confirmación es ≥ 80%** (ajustable en *Quality Gates*).
+
+### Qué muestra (estilo TradeAxis DOL Pro)
+- **DOL activo**: línea ámbar gruesa dentro de una banda de tolerancia con borde discontinuo, una etiqueta central `1. PDH · 122 bars` y una etiqueta a la derecha `◆ A PDH / 1D 58.3%`. Una línea punteada une el precio con el objetivo.
+- **HUD** (arriba a la derecha): `◆ A PDH | precio` · `PoT 120b ████░░ %` · `Confirmation ████ %` · `Distance × 15m ATR ↑` · `Engines 1H · 15m` · `Session ▲ UP → LON-H` · `Order Flow` · **TIMEFRAME BIAS** (4H / 1H / 15m) · **CANDIDATE LADDER** (los siguientes objetivos con su puntuación).
+- Si ningún objetivo llega al 80%, el HUD muestra `◇ WAITING ≥ 80%` junto con el mejor candidato del momento.
+- **Niveles de liquidez**: PDH/PDL, PWH/PWL, ASIA-H/L, LON-H/L, NY-H/L, BSL/SSL y EQH/EQL de 1H y 15m.
+- **Zonas FVG** de 1H y 15m (BFVG alcista, SFVG bajista), con relleno parcial, y el **+ ANCHOR FVG** en el lado opuesto al objetivo.
+- Opcional: BOS / MSS en el gráfico y barras de desequilibrio de order flow.
+
+### Confirmación (0–100)
+| Pilar | Peso | Lógica |
+|---|---|---|
+| Profundidad de liquidez | 25 | PWH/PWL 22 · PDH/PDL 20 · Sesión 14–15 · EQH/EQL +5 por toque · FVG según tamaño · +5 por cada nivel fusionado entre temporalidades |
+| Alineación HTF | 25 | Sesgo 1H (12) + 15m (8) + 4H (5) a favor del objetivo |
+| Order flow | 15 | % de compradores/vendedores estimado (delta acumulado) a favor |
+| Proximidad | 20 | Distancia en ATR de 15m (máximo 12 ATR) |
+| Camino libre | 15 | −5 por cada FVG que bloquea el camino hasta el objetivo |
+
+**PoT** (probabilidad de toque): modelo de difusión con deriva sobre las últimas 200 velas de 1m. Horizonte de 120 velas, con tope del 95%.
+
+---
+
 # DOL Engine · Liquidity Compass
 
 Indicador para TradingView (Pine Script v6) que detecta, puntúa y sigue el **Draw on Liquidity (DOL)**, es decir, el nivel de liquidez hacia el que es más probable que se mueva el precio. Usa conceptos **ICT / Smart Money** y una estimación de **order flow**.

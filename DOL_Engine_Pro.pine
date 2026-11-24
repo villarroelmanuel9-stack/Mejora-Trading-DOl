@@ -1,0 +1,784 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  DOL Engine Pro · Draw on Liquidity
+//  Built for the 1-minute chart. Liquidity targets are mined on two engine
+//  timeframes (default 1H + 15m) plus daily/weekly and session levels, merged
+//  across timeframes, scored 0-100 (Confirmation) and shown only when the
+//  Confirmation passes the quality gate (default ≥ 80 %).
+//
+//  Confirmation = Liquidity Depth 25 · HTF Alignment 25 · Order Flow 15
+//               · Proximity 20 · Path Clarity 15
+//  PoT % = drift-diffusion probability of touching the level within N bars.
+//
+//  Structural data comes from CLOSED higher-timeframe candles ([1] + lookahead)
+//  → levels do not repaint. The active target / HUD update live.
+//  Educational tool — not financial advice.
+// ════════════════════════════════════════════════════════════════════════════
+indicator("DOL Engine Pro · Draw on Liquidity", shorttitle = "DOL Engine Pro", overlay = true,
+     max_boxes_count = 100, max_lines_count = 200, max_labels_count = 200, max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────── INPUTS ─────
+grpE = "⚙ Engines"
+iTfA    = input.timeframe("60", "Engine A (major)", group = grpE)
+iTfB    = input.timeframe("15", "Engine B (minor)", group = grpE)
+iTfC    = input.timeframe("240", "Context Bias TF", group = grpE)
+iLen    = input.int(3, "Engine Swing Length", minval = 2, maxval = 10, group = grpE)
+iEqTol  = input.float(0.10, "EQH / EQL Tolerance (× engine ATR)", minval = 0.01, step = 0.01, group = grpE)
+iFvgMin = input.float(0.25, "Min FVG Size (× engine ATR)", minval = 0.0, step = 0.05, group = grpE)
+
+grpQ = "🎯 Quality Gates"
+iMinConv   = input.int(80, "Min Confirmation to Show DOL (%)", minval = 0, maxval = 100, group = grpQ)
+iMinPoT    = input.float(0.0, "Min PoT to Show DOL (%)", minval = 0.0, maxval = 95.0, step = 1.0, group = grpQ)
+iMaxATR    = input.float(12.0, "Max Distance (× Engine B ATR)", minval = 1.0, step = 0.5, group = grpQ)
+iHorizon   = input.int(120, "PoT Horizon (chart bars)", minval = 10, maxval = 2000, group = grpQ)
+iMergeTol  = input.float(0.25, "Cross-TF Merge Tolerance (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpQ)
+iScoreBars = input.int(300, "Scored Bars (alerts / ghost history)", minval = 50, maxval = 3000, group = grpQ)
+
+grpS = "🕒 Sessions"
+iTz   = input.string("America/New_York", "Timezone", group = grpS)
+iAsia = input.session("2000-0000", "Asia", group = grpS)
+iLon  = input.session("0200-0500", "London", group = grpS)
+iNy   = input.session("0930-1100", "New York AM", group = grpS)
+
+grpD = "🖥 Display"
+iShowLevels = input.bool(true, "Liquidity Levels (PDH, LON, ASIA, EQH…)", group = grpD)
+iShowFvg    = input.bool(true, "Engine FVG Zones", group = grpD)
+iShowAnchor = input.bool(true, "Anchor FVG", group = grpD)
+iLadderN    = input.int(2, "Ladder Targets on Chart", minval = 0, maxval = 4, group = grpD)
+iShowMS     = input.bool(false, "BOS / MSS (chart TF)", group = grpD)
+iMsLen      = input.int(5, "BOS / MSS Swing Length", minval = 2, maxval = 30, group = grpD)
+iGhosts     = input.int(5, "Ghost Trail (reached DOLs)", minval = 0, maxval = 30, group = grpD)
+iOffset     = input.int(30, "Right Offset (bars)", minval = 5, maxval = 200, group = grpD)
+
+grpH = "📊 HUD"
+iShowHud = input.bool(true, "Show HUD", group = grpH)
+iHudPos  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpH)
+iHudSize = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = grpH)
+
+grpF = "🌊 Order Flow"
+iFlowLen = input.int(30, "Delta Lookback (chart bars)", minval = 5, group = grpF)
+iShowImb = input.bool(false, "Mark Volume Imbalance Bars", group = grpF)
+iImbRvol = input.float(2.5, "Imbalance RVOL ≥", minval = 1.0, step = 0.1, group = grpF)
+
+grpC = "🎨 Theme"
+cAcc  = input.color(#F0A830, "Accent (amber)", group = grpC)
+cBear = input.color(#E0705A, "Bearish", group = grpC)
+cTxt  = input.color(#D9D4C7, "Text", group = grpC)
+cMute = input.color(#7A7468, "Muted", group = grpC)
+cBg   = input.color(#0F0D09, "Panel Background", group = grpC)
+cRow  = input.color(#17140E, "Panel Row", group = grpC)
+
+CLEAR = #00000000
+
+// ─────────────────────────────────────────────────────────────── HELPERS ────
+f_tfName(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 ? "1W" : s >= 86400 ? "1D" : s >= 3600 ? str.tostring(int(s / 3600)) + "H" : str.tostring(int(s / 60)) + "m"
+
+f_bar(float pct) =>
+    int n = int(math.round(math.max(0.0, math.min(100.0, pct)) / 10.0))
+    str.repeat("█", n) + str.repeat("░", 10 - n)
+
+f_grade(float c) =>
+    c >= 90 ? "A+" : c >= 80 ? "A" : c >= 65 ? "B" : "C"
+
+f_biasTxt(int b) =>
+    b == 1 ? "BULL" : b == -1 ? "BEAR" : "NEUTRAL"
+
+f_biasCol(int b) =>
+    b == 1 ? cAcc : b == -1 ? cBear : cMute
+
+f_pos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+hudSize = iHudSize == "Tiny" ? size.tiny : iHudSize == "Normal" ? size.normal : size.small
+
+// standard normal CDF (Abramowitz-Stegun)
+f_ncdf(float x) =>
+    float t = 1.0 / (1.0 + 0.2316419 * math.abs(x))
+    float d = 0.3989423 * math.exp(-x * x / 2.0)
+    float p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+    x > 0 ? 1.0 - p : p
+
+// ───────────────────────────────────────────────────── HTF LIQUIDITY ENGINE ─
+// Runs inside request.security on the engine timeframe. Tracks unswept swing
+// highs/lows (with EQH/EQL clustering), unmitigated FVGs (partial fill) and a
+// body-close structure bias. Returns the CLOSED-bar values ([1]).
+f_engine(int len, float eqTol, float fvgMin) =>
+    var array<float> hiP  = array.new<float>()
+    var array<int>   hiT  = array.new<int>()
+    var array<int>   hiE  = array.new<int>()
+    var array<float> loP  = array.new<float>()
+    var array<int>   loT  = array.new<int>()
+    var array<int>   loE  = array.new<int>()
+    var array<float> fTop = array.new<float>()
+    var array<float> fBtm = array.new<float>()
+    var array<int>   fT   = array.new<int>()
+    var array<int>   fD   = array.new<int>()
+    var int   bias = 0
+    var float sh   = na
+    var float sl   = na
+    float a  = nz(ta.atr(14), high - low)
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+
+    // sweeps of resting liquidity
+    if hiP.size() > 0
+        for i = hiP.size() - 1 to 0
+            if high > hiP.get(i)
+                hiP.remove(i)
+                hiT.remove(i)
+                hiE.remove(i)
+    if loP.size() > 0
+        for i = loP.size() - 1 to 0
+            if low < loP.get(i)
+                loP.remove(i)
+                loT.remove(i)
+                loE.remove(i)
+
+    // FVG mitigation (partial fill shrinks, full fill deletes)
+    if fTop.size() > 0
+        for i = fTop.size() - 1 to 0
+            bool kill = false
+            if fD.get(i) == 1
+                if low <= fBtm.get(i)
+                    kill := true
+                else if low < fTop.get(i)
+                    fTop.set(i, low)
+            else
+                if high >= fTop.get(i)
+                    kill := true
+                else if high > fBtm.get(i)
+                    fBtm.set(i, high)
+            if kill
+                fTop.remove(i)
+                fBtm.remove(i)
+                fT.remove(i)
+                fD.remove(i)
+
+    // new swing highs → BSL / EQH
+    if not na(ph)
+        sh := ph
+        int f = -1
+        if hiP.size() > 0
+            for i = 0 to hiP.size() - 1
+                if math.abs(hiP.get(i) - ph) <= eqTol * a
+                    f := i
+                    break
+        if f >= 0
+            hiE.set(f, hiE.get(f) + 1)
+            hiP.set(f, math.max(hiP.get(f), ph))
+        else
+            hiP.push(ph)
+            hiT.push(time[len])
+            hiE.push(1)
+            if hiP.size() > 12
+                hiP.shift()
+                hiT.shift()
+                hiE.shift()
+
+    // new swing lows → SSL / EQL
+    if not na(pl)
+        sl := pl
+        int f = -1
+        if loP.size() > 0
+            for i = 0 to loP.size() - 1
+                if math.abs(loP.get(i) - pl) <= eqTol * a
+                    f := i
+                    break
+        if f >= 0
+            loE.set(f, loE.get(f) + 1)
+            loP.set(f, math.min(loP.get(f), pl))
+        else
+            loP.push(pl)
+            loT.push(time[len])
+            loE.push(1)
+            if loP.size() > 12
+                loP.shift()
+                loT.shift()
+                loE.shift()
+
+    // structure bias (candle body close through the last swing)
+    if not na(sh) and close > sh
+        bias := 1
+        sh   := na
+    if not na(sl) and close < sl
+        bias := -1
+        sl   := na
+
+    // new FVGs
+    if low > high[2] and low - high[2] >= fvgMin * a
+        fTop.push(low)
+        fBtm.push(high[2])
+        fT.push(time[1])
+        fD.push(1)
+    if high < low[2] and low[2] - high >= fvgMin * a
+        fTop.push(low[2])
+        fBtm.push(high)
+        fT.push(time[1])
+        fD.push(-1)
+    if fTop.size() > 12
+        fTop.shift()
+        fBtm.shift()
+        fT.shift()
+        fD.shift()
+
+    // nearest liquidity above / below + nearest equal-highs/lows cluster
+    float bP  = na
+    int   bT  = na
+    int   bE  = 0
+    int   bI  = -1
+    float qhP = na
+    int   qhT = na
+    int   qhE = 0
+    if hiP.size() > 0
+        for i = 0 to hiP.size() - 1
+            float p = hiP.get(i)
+            if p > close and (na(bP) or p < bP)
+                bP := p
+                bT := hiT.get(i)
+                bE := hiE.get(i)
+                bI := i
+        for i = 0 to hiP.size() - 1
+            float p = hiP.get(i)
+            if i != bI and hiE.get(i) >= 2 and p > close and (na(qhP) or p < qhP)
+                qhP := p
+                qhT := hiT.get(i)
+                qhE := hiE.get(i)
+    float sP  = na
+    int   sT  = na
+    int   sE  = 0
+    int   sI  = -1
+    float qlP = na
+    int   qlT = na
+    int   qlE = 0
+    if loP.size() > 0
+        for i = 0 to loP.size() - 1
+            float p = loP.get(i)
+            if p < close and (na(sP) or p > sP)
+                sP := p
+                sT := loT.get(i)
+                sE := loE.get(i)
+                sI := i
+        for i = 0 to loP.size() - 1
+            float p = loP.get(i)
+            if i != sI and loE.get(i) >= 2 and p < close and (na(qlP) or p > qlP)
+                qlP := p
+                qlT := loT.get(i)
+                qlE := loE.get(i)
+    float uTop = na
+    float uBtm = na
+    int   uT   = na
+    float dTop = na
+    float dBtm = na
+    int   dT   = na
+    if fTop.size() > 0
+        for i = 0 to fTop.size() - 1
+            float tp = fTop.get(i)
+            float bt = fBtm.get(i)
+            if bt > close and (na(uBtm) or bt < uBtm)
+                uTop := tp
+                uBtm := bt
+                uT   := fT.get(i)
+            if tp < close and (na(dTop) or tp > dTop)
+                dTop := tp
+                dBtm := bt
+                dT   := fT.get(i)
+    [bP[1], bT[1], bE[1], qhP[1], qhT[1], qhE[1], sP[1], sT[1], sE[1], qlP[1], qlT[1], qlE[1], uTop[1], uBtm[1], uT[1], dTop[1], dBtm[1], dT[1], bias[1], a[1]]
+
+f_bias(int len) =>
+    var int   t  = 0
+    var float sh = na
+    var float sl = na
+    float ph_ = ta.pivothigh(high, len, len)
+    float pl_ = ta.pivotlow(low, len, len)
+    if not na(ph_)
+        sh := ph_
+    if not na(pl_)
+        sl := pl_
+    if not na(sh) and close > sh
+        t  := 1
+        sh := na
+    if not na(sl) and close < sl
+        t  := -1
+        sl := na
+    t[1]
+
+// running high / low of the current (still forming) higher-timeframe candle
+f_run(string tf) =>
+    var float rh = na
+    var float rl = na
+    if timeframe.change(tf)
+        rh := high
+        rl := low
+    else
+        rh := math.max(nz(rh, high), high)
+        rl := math.min(nz(rl, low), low)
+    [rh, rl]
+
+// last completed session high / low, na once swept
+f_session(string sess, string tz) =>
+    bool inS = not na(time(timeframe.period, sess, tz))
+    var float rh = na
+    var float rl = na
+    var int   rht = na
+    var int   rlt = na
+    var float H  = na
+    var float L  = na
+    var int   Ht = na
+    var int   Lt = na
+    var bool  hSw = false
+    var bool  lSw = false
+    if inS and not inS[1]
+        rh  := high
+        rl  := low
+        rht := time
+        rlt := time
+    else if inS
+        if high > rh
+            rh  := high
+            rht := time
+        if low < rl
+            rl  := low
+            rlt := time
+    if not inS and inS[1]
+        H   := rh
+        L   := rl
+        Ht  := rht
+        Lt  := rlt
+        hSw := false
+        lSw := false
+    if not inS and not na(H)
+        if high > H
+            hSw := true
+        if low < L
+            lSw := true
+    [hSw ? na : H, Ht, lSw ? na : L, Lt, inS]
+
+// ──────────────────────────────────────────────────────────── DATA FEEDS ────
+[aBP, aBT, aBE, aQhP, aQhT, aQhE, aSP, aST, aSE, aQlP, aQlT, aQlE, aUTop, aUBtm, aUT, aDTop, aDBtm, aDT, rawBiasA, atrA] = request.security(syminfo.tickerid, iTfA, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
+[bBP, bBT, bBE, bQhP, bQhT, bQhE, bSP, bST, bSE, bQlP, bQlT, bQlE, bUTop, bUBtm, bUT, bDTop, bDBtm, bDT, rawBiasB, atrB] = request.security(syminfo.tickerid, iTfB, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
+biasA = nz(rawBiasA)
+biasB = nz(rawBiasB)
+biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = barmerge.lookahead_on))
+
+[pdh, pdl, pdt] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl, pwt] = request.security(syminfo.tickerid, "W", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+
+[runHiA, runLoA] = f_run(iTfA)
+[runHiB, runLoB] = f_run(iTfB)
+[runHiD, runLoD] = f_run("D")
+[runHiW, runLoW] = f_run("W")
+
+[asH, asHt, asL, asLt, inAsia] = f_session(iAsia, iTz)
+[lnH, lnHt, lnL, lnLt, inLon]  = f_session(iLon, iTz)
+[nyH, nyHt, nyL, nyLt, inNy]   = f_session(iNy, iTz)
+
+var float dayOpen = na
+if timeframe.change("D")
+    dayOpen := open
+
+// order flow (estimated delta from bar location of close)
+vol     = nz(volume, 1.0)
+volAvg  = ta.sma(vol, 50)
+rvol    = volAvg > 0 ? vol / volAvg : 1.0
+barRng  = high - low
+delta   = barRng > 0 ? vol * (2.0 * close - high - low) / barRng : 0.0
+sDelta  = math.sum(delta, iFlowLen)
+sVol    = math.sum(vol, iFlowLen)
+flowPct = sVol > 0 ? 50.0 + 50.0 * sDelta / sVol : 50.0
+
+// volatility for PoT
+chg   = close - close[1]
+sigma = ta.stdev(chg, 200)
+mu    = ta.sma(chg, 200)
+
+f_pot(float dist, int dir) =>
+    float s = nz(sigma) * math.sqrt(iHorizon)
+    float r = 0.0
+    if s > 0
+        float m = nz(mu) * dir * 0.5
+        float e = math.min(50.0, 2.0 * m * dist / (sigma * sigma))
+        r := f_ncdf((-dist + m * iHorizon) / s) + math.exp(e) * f_ncdf((-dist - m * iHorizon) / s)
+    math.min(95.0, 100.0 * math.min(1.0, r))
+
+atrRef = math.max(nz(atrB, ta.atr(14)), syminfo.mintick)
+
+// ──────────────────────────────────────────────────────────── CANDIDATES ────
+type Cand
+    string name
+    string tf
+    float  top
+    float  btm
+    int    t
+    int    dir
+    int    tier
+    float  depth
+    bool   zone
+    int    merged = 0
+    float  conv   = 0.0
+    float  pot    = 0.0
+    float  dist   = 0.0
+
+f_edge(Cand c) =>
+    c.dir == 1 ? c.btm : c.top
+
+// add with cross-timeframe arbitration (overlapping pools merge, higher tier wins)
+f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int tier, float depth, bool zone, float tol) =>
+    if not na(top) and not na(btm) and not na(t)
+        int dir = btm > close ? 1 : top < close ? -1 : 0
+        if dir != 0
+            float edge = dir == 1 ? btm : top
+            bool  done = false
+            if cs.size() > 0
+                for i = 0 to cs.size() - 1
+                    Cand c = cs.get(i)
+                    if c.dir == dir and math.abs(f_edge(c) - edge) <= tol
+                        c.merged := c.merged + 1
+                        if tier > c.tier or (tier == c.tier and depth > c.depth)
+                            c.name := name
+                            c.tf   := tf
+                            c.top  := top
+                            c.btm  := btm
+                            c.t    := t
+                            c.tier := tier
+                            c.zone := zone
+                        c.depth := math.max(c.depth, depth) + 5.0
+                        done := true
+                        break
+            if not done
+                cs.push(Cand.new(name = name, tf = tf, top = top, btm = btm, t = t, dir = dir, tier = tier, depth = depth, zone = zone))
+    cs
+
+f_fvgDepth(float top, float btm, float a) =>
+    math.min(18.0, 8.0 + 10.0 * (top - btm) / math.max(nz(a, atrRef), syminfo.mintick))
+
+doScore = last_bar_index - bar_index <= iScoreBars
+tfAName = f_tfName(iTfA)
+tfBName = f_tfName(iTfB)
+
+array<Cand> cs = array.new<Cand>()
+if doScore
+    float tol = iMergeTol * atrRef
+    // weekly / daily
+    if runHiW < pwh
+        f_add(cs, "PWH", "1W", pwh, pwh, pwt, 4, 22.0, false, tol)
+    if runLoW > pwl
+        f_add(cs, "PWL", "1W", pwl, pwl, pwt, 4, 22.0, false, tol)
+    if runHiD < pdh
+        f_add(cs, "PDH", "1D", pdh, pdh, pdt, 3, 20.0, false, tol)
+    if runLoD > pdl
+        f_add(cs, "PDL", "1D", pdl, pdl, pdt, 3, 20.0, false, tol)
+    // sessions
+    f_add(cs, "LON-H", "SES", lnH, lnH, lnHt, 2, 15.0, false, tol)
+    f_add(cs, "LON-L", "SES", lnL, lnL, lnLt, 2, 15.0, false, tol)
+    f_add(cs, "ASIA-H", "SES", asH, asH, asHt, 2, 14.0, false, tol)
+    f_add(cs, "ASIA-L", "SES", asL, asL, asLt, 2, 14.0, false, tol)
+    f_add(cs, "NY-H", "SES", nyH, nyH, nyHt, 2, 15.0, false, tol)
+    f_add(cs, "NY-L", "SES", nyL, nyL, nyLt, 2, 15.0, false, tol)
+    // engine A (major)
+    if runHiA < aBP
+        f_add(cs, aBE >= 2 ? "EQH" : "BSL", tfAName, aBP, aBP, aBT, 2, 13.0 + 5.0 * (aBE - 1), false, tol)
+    if runHiA < aQhP
+        f_add(cs, "EQH", tfAName, aQhP, aQhP, aQhT, 2, 13.0 + 5.0 * (aQhE - 1), false, tol)
+    if runLoA > aSP
+        f_add(cs, aSE >= 2 ? "EQL" : "SSL", tfAName, aSP, aSP, aST, 2, 13.0 + 5.0 * (aSE - 1), false, tol)
+    if runLoA > aQlP
+        f_add(cs, "EQL", tfAName, aQlP, aQlP, aQlT, 2, 13.0 + 5.0 * (aQlE - 1), false, tol)
+    if runHiA < aUTop
+        f_add(cs, "SFVG", tfAName, aUTop, math.max(aUBtm, runHiA), aUT, 2, 3.0 + f_fvgDepth(aUTop, aUBtm, atrA), true, tol)
+    if runLoA > aDBtm
+        f_add(cs, "BFVG", tfAName, math.min(aDTop, runLoA), aDBtm, aDT, 2, 3.0 + f_fvgDepth(aDTop, aDBtm, atrA), true, tol)
+    // engine B (minor)
+    if runHiB < bBP
+        f_add(cs, bBE >= 2 ? "EQH" : "BSL", tfBName, bBP, bBP, bBT, 1, 10.0 + 5.0 * (bBE - 1), false, tol)
+    if runHiB < bQhP
+        f_add(cs, "EQH", tfBName, bQhP, bQhP, bQhT, 1, 10.0 + 5.0 * (bQhE - 1), false, tol)
+    if runLoB > bSP
+        f_add(cs, bSE >= 2 ? "EQL" : "SSL", tfBName, bSP, bSP, bST, 1, 10.0 + 5.0 * (bSE - 1), false, tol)
+    if runLoB > bQlP
+        f_add(cs, "EQL", tfBName, bQlP, bQlP, bQlT, 1, 10.0 + 5.0 * (bQlE - 1), false, tol)
+    if runHiB < bUTop
+        f_add(cs, "SFVG", tfBName, bUTop, math.max(bUBtm, runHiB), bUT, 1, f_fvgDepth(bUTop, bUBtm, atrB), true, tol)
+    if runLoB > bDBtm
+        f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol)
+
+// ─────────────────────────────────────────────────────────────── SCORING ────
+int nC = cs.size()
+array<float> convs = array.new<float>()
+if nC > 0
+    for i = 0 to nC - 1
+        Cand  c    = cs.get(i)
+        float edge = f_edge(c)
+        float d    = math.abs(edge - close) / atrRef
+        c.dist := d
+        if d <= iMaxATR
+            float sDepth = math.min(25.0, c.depth)
+            float sAlign = (biasA == c.dir ? 12.0 : biasA == 0 ? 5.0 : 0.0) + (biasB == c.dir ? 8.0 : biasB == 0 ? 3.0 : 0.0) +
+                 (biasC == c.dir ? 5.0 : biasC == 0 ? 2.0 : 0.0)
+            float sFlow  = 15.0 * math.max(0.0, math.min(1.0, 0.5 + (flowPct - 50.0) * c.dir / 20.0))
+            float sProx  = 20.0 * (1.0 - d / iMaxATR)
+            int   nBlock = 0
+            for j = 0 to nC - 1
+                if j != i
+                    Cand o = cs.get(j)
+                    if o.zone and o.dir == c.dir
+                        float oe = f_edge(o)
+                        if (c.dir == 1 and oe < edge) or (c.dir == -1 and oe > edge)
+                            nBlock += 1
+            float sClear = math.max(0.0, 15.0 - 5.0 * nBlock)
+            c.conv := math.min(100.0, sDepth + sAlign + sFlow + sProx + sClear)
+            c.pot  := f_pot(math.abs(edge - close), c.dir)
+        convs.push(c.conv)
+
+array<int> rankIdx = nC > 0 ? convs.sort_indices(order.descending) : array.new<int>()
+
+int primI = -1
+int bestI = -1
+if nC > 0
+    bestI := rankIdx.get(0)
+    for k = 0 to nC - 1
+        Cand c = cs.get(rankIdx.get(k))
+        if c.conv >= iMinConv and c.pot >= iMinPoT and c.conv > 0
+            primI := rankIdx.get(k)
+            break
+
+// ─────────────────────────────────────────────────────── EVENTS / GHOSTS ────
+var string primKey  = ""
+var float  primLvl  = na
+var int    primDir  = 0
+var int    primT    = na
+var string primName = ""
+var array<line>  ghostL  = array.new<line>()
+var array<label> ghostLb = array.new<label>()
+
+bool evNew   = false
+bool evSwept = false
+
+if barstate.isconfirmed and doScore
+    if primKey != "" and ((primDir == 1 and high >= primLvl) or (primDir == -1 and low <= primLvl))
+        evSwept := true
+        if iGhosts > 0
+            ghostL.push(line.new(primT, primLvl, time, primLvl, xloc = xloc.bar_time, color = color.new(cAcc, 45), style = line.style_dotted, width = 2))
+            ghostLb.push(label.new(time, primLvl, "✓ " + primName, xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR,
+                 textcolor = color.new(cAcc, 35), size = size.tiny, text_font_family = font.family_monospace))
+            if ghostL.size() > iGhosts
+                ghostL.shift().delete()
+                ghostLb.shift().delete()
+        primKey := ""
+    if primI >= 0
+        Cand   p = cs.get(primI)
+        string k = p.name + p.tf + str.tostring(f_edge(p))
+        if k != primKey
+            evNew := true
+        primKey  := k
+        primLvl  := f_edge(p)
+        primDir  := p.dir
+        primT    := p.t
+        primName := p.name + " " + p.tf
+    else
+        primKey := ""
+
+// ───────────────────────────────────────────── CHART-TF STRUCTURE (opt.) ────
+var float msH = na
+var int   msHt = na
+var bool  msHUsed = true
+var float msL = na
+var int   msLt = na
+var bool  msLUsed = true
+var int   msTrend = 0
+var array<line>  msLines = array.new<line>()
+var array<label> msLbls  = array.new<label>()
+mph = ta.pivothigh(high, iMsLen, iMsLen)
+mpl = ta.pivotlow(low, iMsLen, iMsLen)
+bool evMS = false
+if iShowMS and barstate.isconfirmed and last_bar_index - bar_index <= 1500
+    if not na(mph)
+        msH := mph
+        msHt := time[iMsLen]
+        msHUsed := false
+    if not na(mpl)
+        msL := mpl
+        msLt := time[iMsLen]
+        msLUsed := false
+    if not na(msH) and not msHUsed and close > msH
+        msHUsed := true
+        evMS := true
+        msLines.push(line.new(msHt, msH, time, msH, xloc = xloc.bar_time, color = color.new(cAcc, 40), style = line.style_dashed))
+        msLbls.push(label.new(time, msH, msTrend < 0 ? "MSS" : "BOS", xloc = xloc.bar_time, style = label.style_label_down, color = CLEAR,
+             textcolor = color.new(cAcc, 20), size = size.tiny, text_font_family = font.family_monospace))
+        msTrend := 1
+    if not na(msL) and not msLUsed and close < msL
+        msLUsed := true
+        evMS := true
+        msLines.push(line.new(msLt, msL, time, msL, xloc = xloc.bar_time, color = color.new(cBear, 40), style = line.style_dashed))
+        msLbls.push(label.new(time, msL, msTrend > 0 ? "MSS" : "BOS", xloc = xloc.bar_time, style = label.style_label_up, color = CLEAR,
+             textcolor = color.new(cBear, 20), size = size.tiny, text_font_family = font.family_monospace))
+        msTrend := -1
+    if msLines.size() > 30
+        msLines.shift().delete()
+        msLbls.shift().delete()
+
+// ─────────────────────────────────────────────────────────────── VISUALS ────
+var array<line>  dLines  = array.new<line>()
+var array<label> dLabels = array.new<label>()
+var array<box>   dBoxes  = array.new<box>()
+var table hud = table.new(f_pos(iHudPos), 2, 17, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
+
+f_hud(int r, string l, string v, color lc, color vc, color bg) =>
+    table.cell(hud, 0, r, l, text_color = lc, text_halign = text.align_left, text_size = hudSize, bgcolor = bg, text_font_family = font.family_monospace)
+    table.cell(hud, 1, r, v, text_color = vc, text_halign = text.align_right, text_size = hudSize, bgcolor = bg, text_font_family = font.family_monospace)
+
+if barstate.islast
+    while dLines.size() > 0
+        dLines.pop().delete()
+    while dLabels.size() > 0
+        dLabels.pop().delete()
+    while dBoxes.size() > 0
+        dBoxes.pop().delete()
+
+    int tms = timeframe.in_seconds(timeframe.period) * 1000
+    int xR  = time + iOffset * tms
+    int xL2 = time + int(iOffset * 0.55) * tms
+
+    array<bool> drawn = array.new<bool>(nC, false)
+
+    // ── primary DOL: band + thick line + trajectory + labels
+    if primI >= 0
+        drawn.set(primI, true)
+        Cand  p    = cs.get(primI)
+        float edge = f_edge(p)
+        float band = 0.15 * atrRef
+        float bTop = p.zone ? p.top + band * 0.5 : edge + band
+        float bBtm = p.zone ? p.btm - band * 0.5 : edge - band
+        dBoxes.push(box.new(p.t, bTop, xR, bBtm, xloc = xloc.bar_time, border_color = color.new(cAcc, 45), border_style = line.style_dashed,
+             border_width = 1, bgcolor = color.new(cAcc, 90)))
+        dLines.push(line.new(p.t, edge, xR, edge, xloc = xloc.bar_time, color = cAcc, width = 3))
+        dLines.push(line.new(time, close, xR, edge, xloc = xloc.bar_time, color = color.new(cAcc, 35), style = line.style_dotted, width = 1))
+        int bars = int((time - p.t) / tms)
+        dLabels.push(label.new(int(p.t + (xR - p.t) / 2), edge, "1. " + p.name + " · " + str.tostring(bars) + " bars", xloc = xloc.bar_time,
+             style = label.style_label_center, color = cBg, textcolor = color.new(cAcc, 25), size = size.tiny, text_font_family = font.family_monospace))
+        dLabels.push(label.new(xR, edge, "◆ " + f_grade(p.conv) + "  " + p.name + (p.merged > 0 ? "  ⊕" + str.tostring(p.merged) : "") + "\n" +
+             p.tf + "  " + str.tostring(p.pot, "#.0") + "%", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
+             textcolor = cAcc, size = size.small, textalign = text.align_left, text_font_family = font.family_monospace))
+
+    // ── candidate ladder (runner-ups)
+    int rank = 2
+    if nC > 0 and iLadderN > 0
+        for k = 0 to nC - 1
+            int i = rankIdx.get(k)
+            Cand c = cs.get(i)
+            if i != primI and c.conv > 0 and rank <= iLadderN + 1
+                drawn.set(i, true)
+                float e = f_edge(c)
+                dLines.push(line.new(c.t, e, xL2, e, xloc = xloc.bar_time, color = color.new(cAcc, 55), style = line.style_dashed, width = 1))
+                dLabels.push(label.new(xL2, e, str.tostring(rank) + ". " + c.name + " " + c.tf + " · " + str.tostring(c.conv, "#"),
+                     xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR, textcolor = color.new(cAcc, 40), size = size.tiny,
+                     text_font_family = font.family_monospace))
+                rank += 1
+
+    // ── anchor FVG: nearest imbalance on the opposite side of the draw
+    if iShowAnchor and primI >= 0 and nC > 0
+        int   pd   = cs.get(primI).dir
+        int   aI   = -1
+        float aD   = 1e10
+        for i = 0 to nC - 1
+            Cand c = cs.get(i)
+            if c.zone and c.dir == -pd and c.dist < aD
+                aD := c.dist
+                aI := i
+        if aI >= 0
+            Cand  an  = cs.get(aI)
+            float mid = (an.top + an.btm) / 2.0
+            dLines.push(line.new(an.t, mid, xL2, mid, xloc = xloc.bar_time, color = color.new(cAcc, 50), style = line.style_dotted, width = 1))
+            dLabels.push(label.new(xL2, mid, "+ ANCHOR " + an.name + " " + an.tf, xloc = xloc.bar_time, style = label.style_label_left,
+                 color = cRow, textcolor = color.new(cTxt, 30), size = size.tiny, text_font_family = font.family_monospace))
+
+    // ── remaining liquidity levels / FVG zones
+    if nC > 0
+        for i = 0 to nC - 1
+            Cand c = cs.get(i)
+            if c.zone
+                if iShowFvg
+                    dBoxes.push(box.new(c.t, c.top, xL2, c.btm, xloc = xloc.bar_time, border_color = color.new(cAcc, 50), border_width = 1,
+                         bgcolor = color.new(cAcc, drawn.get(i) ? 86 : 90), text = c.name + " " + c.tf, text_size = size.tiny,
+                         text_color = color.new(cAcc, 45), text_halign = text.align_right, text_valign = text.align_center,
+                         text_font_family = font.family_monospace))
+            else if iShowLevels and not drawn.get(i)
+                float e = f_edge(c)
+                dLines.push(line.new(c.t, e, xL2, e, xloc = xloc.bar_time, color = color.new(cMute, 40), style = line.style_dotted, width = 1))
+                dLabels.push(label.new(xL2, e, c.name, xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR,
+                     textcolor = color.new(cMute, 10), size = size.tiny, text_font_family = font.family_monospace))
+
+    // ── HUD
+    if iShowHud
+        table.clear(hud, 0, 0, 1, 16)
+        f_hud(0, "DOL ENGINE PRO", f_tfName(timeframe.period), cAcc, cMute, cBg)
+        int   si   = primI >= 0 ? primI : bestI
+        bool  live = primI >= 0
+        if si >= 0
+            Cand  s    = cs.get(si)
+            float edge = f_edge(s)
+            color vc   = live ? cAcc : cMute
+            if live
+                f_hud(1, "◆ " + f_grade(s.conv) + "   " + s.name + " " + s.tf, str.tostring(edge, format.mintick), cAcc, cTxt, cRow)
+            else
+                f_hud(1, "◇ WAITING ≥ " + str.tostring(iMinConv) + "%", "best " + s.name + " " + s.tf, cMute, cMute, cRow)
+            f_hud(2, "PoT " + str.tostring(iHorizon) + "b", f_bar(s.pot) + " " + str.tostring(s.pot, "#.0") + "%", cMute, vc, cBg)
+            f_hud(3, "Confirmation", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
+            f_hud(4, "Distance", str.tostring(s.dist, "#.##") + " × " + tfBName + " ATR " + (s.dir == 1 ? "↑" : "↓"), cMute, vc, cBg)
+        else
+            f_hud(1, "◇ NO TARGET", "in range", cMute, cMute, cRow)
+        f_hud(5, "Engines", tfAName + " · " + tfBName, cMute, cMute, cBg)
+        // session flow
+        string sesName = inAsia ? "ASIA" : inLon ? "LON" : inNy ? "NY" : "—"
+        int    sDir    = close >= nz(dayOpen, close) ? 1 : -1
+        string sTgt    = "—"
+        float  sBest   = 1e10
+        if nC > 0
+            for i = 0 to nC - 1
+                Cand c = cs.get(i)
+                if c.tf == "SES" and c.dir == sDir and c.dist < sBest
+                    sBest := c.dist
+                    sTgt  := c.name
+        f_hud(6, "Session " + sesName, (sDir == 1 ? "▲ UP" : "▼ DOWN") + "  → " + sTgt, cMute, sDir == 1 ? cAcc : cBear, cBg)
+        f_hud(7, "Order Flow", (flowPct >= 50 ? "BUY " : "SELL ") + str.tostring(flowPct >= 50 ? flowPct : 100 - flowPct, "#") + "%",
+             cMute, flowPct >= 55 ? cAcc : flowPct <= 45 ? cBear : cMute, cBg)
+        f_hud(8, "TIMEFRAME BIAS", "", cMute, cMute, cRow)
+        f_hud(9, f_tfName(iTfC), f_biasTxt(biasC), cTxt, f_biasCol(biasC), cBg)
+        f_hud(10, tfAName, f_biasTxt(biasA), cTxt, f_biasCol(biasA), cBg)
+        f_hud(11, tfBName, f_biasTxt(biasB), cTxt, f_biasCol(biasB), cBg)
+        f_hud(12, "CANDIDATE LADDER", "", cMute, cMute, cRow)
+        int row = 13
+        if nC > 0
+            for k = 0 to nC - 1
+                int i = rankIdx.get(k)
+                Cand c = cs.get(i)
+                if i != primI and c.conv > 0 and row <= 15
+                    f_hud(row, str.tostring(row - 11) + ". " + c.name + " " + c.tf + (c.dir == 1 ? " ↑" : " ↓"),
+                         str.tostring(c.conv, "#") + " · " + str.tostring(c.pot, "#") + "%", cTxt, c.conv >= iMinConv ? cAcc : cMute, cBg)
+                    row += 1
+        if timeframe.in_seconds(timeframe.period) > 60
+            f_hud(16, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
+
+// ──────────────────────────────────────────────── ORDER-FLOW IMBALANCE ──────
+imbUp = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol >= 0.5
+imbDn = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol <= -0.5
+plotshape(imbUp, "Buy Imbalance", shape.triangleup, location.belowbar, color.new(cAcc, 30), size = size.tiny)
+plotshape(imbDn, "Sell Imbalance", shape.triangledown, location.abovebar, color.new(cBear, 30), size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────── ALERTS ─────
+alertcondition(evNew,   "DOL ≥ threshold active", "DOL Engine Pro · new high-confirmation DOL on {{ticker}}")
+alertcondition(evSwept, "DOL target reached",     "DOL Engine Pro · DOL target reached on {{ticker}}")
+alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure break on {{ticker}}")
+
+if evNew and primI >= 0
+    Cand p = cs.get(primI)
+    alert("DOL Engine Pro · " + (p.dir == 1 ? "▲ " : "▼ ") + p.name + " " + p.tf + " @ " + str.tostring(f_edge(p), format.mintick) +
+         " · Confirmation " + str.tostring(p.conv, "#") + "% · PoT " + str.tostring(p.pot, "#.0") + "%", alert.freq_once_per_bar_close)
+if evSwept
+    alert("DOL Engine Pro · target reached: " + primName + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
