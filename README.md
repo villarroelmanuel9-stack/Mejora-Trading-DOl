@@ -23,6 +23,18 @@ Diseñado para usarse en el **gráfico de 1 minuto**. Los objetivos de liquidez 
   - La etiqueta muestra `★n/5`: cuántas confluencias se cumplieron (killzone, MSS, desplazamiento, premium/discount, SMT).
 - Opcional: BOS / MSS en el gráfico y barras de desequilibrio de order flow.
 
+### 📈 Instrumentos: Nasdaq y Oro
+Preset **Auto**: el indicador reconoce el activo del gráfico y ajusta killzones y par SMT (hora de Nueva York).
+
+| | Nasdaq (NQ, MNQ, NAS100, US100, USTEC) | Oro (XAUUSD, GOLD, GC, MGC) |
+|---|---|---|
+| Killzone Londres | 02:00–05:00 | 02:00–05:00 |
+| Killzone NY AM | 08:30–11:00 (datos + apertura cash) | 08:20–11:00 (apertura COMEX) |
+| Killzone NY PM | 13:30–16:00 | 13:30–15:00 |
+| Par SMT | ES1! (futuros) / OANDA:SPX500USD (CFD) | SI1! (futuros) / OANDA:XAGUSD (spot) |
+
+El par SMT se puede cambiar en *Safety Filters*. Usa un símbolo con datos en tiempo real: los futuros CME sin suscripción llegan con 10 minutos de retraso. Si no hay datos del par, el SMT simplemente no suma.
+
 ### 🧠 Auto-aprendizaje (retroalimentación)
 El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
 

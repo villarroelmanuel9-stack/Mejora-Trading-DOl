@@ -18,6 +18,10 @@ indicator("DOL Engine Pro · Draw on Liquidity", shorttitle = "DOL Engine Pro", 
      max_boxes_count = 100, max_lines_count = 200, max_labels_count = 200, max_bars_back = 500)
 
 // ─────────────────────────────────────────────────────────────── INPUTS ─────
+grpI = "📈 Instrument"
+iPreset = input.string("Auto", "Instrument Preset", options = ["Auto", "Nasdaq", "Gold (XAUUSD)", "Custom"], group = grpI,
+     tooltip = "Auto detects Nasdaq (NQ, MNQ, NAS100, US100, USTEC) and Gold (XAUUSD, GOLD, GC, MGC) and sets killzones + SMT pair. Custom uses the killzones from Safety Filters.")
+
 grpE = "⚙ Engines"
 iTfA    = input.timeframe("60", "Engine A (major)", group = grpE)
 iTfB    = input.timeframe("15", "Engine B (minor)", group = grpE)
@@ -72,7 +76,8 @@ iNews2   = input.session("0955-1005", "News Window 2", group = grpSF)
 iNews3   = input.session("1355-1410", "News Window 3", group = grpSF)
 iUsePD   = input.bool(true, "Premium / Discount Filter", group = grpSF,
      tooltip = "SELL only if the sweep happened in premium (above the 2-day range midpoint), BUY only in discount.")
-iSmtSym  = input.symbol("", "SMT Symbol (e.g. ES1! for NQ1!)", group = grpSF)
+iSmtSym  = input.symbol("", "SMT Symbol (blank = preset pair)", group = grpSF,
+     tooltip = "Blank: Nasdaq → ES1! (futures) or SPX500 (CFD) · Gold → SI1! (futures) or XAGUSD (spot). Use a real-time symbol you have data for.")
 iSmtMode = input.string("Bonus", "SMT Divergence", options = ["Off", "Bonus", "Required"], group = grpSF)
 iSmtLen  = input.int(30, "SMT Lookback (bars)", minval = 5, maxval = 200, group = grpSF)
 iConsPoT = input.bool(true, "Conservative PoT", group = grpSF,
@@ -113,6 +118,23 @@ cBg   = input.color(#0F0D09, "Panel Background", group = grpC)
 cRow  = input.color(#17140E, "Panel Row", group = grpC)
 
 CLEAR = #00000000
+
+// ─────────────────────────────────────────────────────────── INSTRUMENT ─────
+tkU   = str.upper(syminfo.ticker)
+isAu  = str.contains(tkU, "XAU") or str.contains(tkU, "GOLD") or str.startswith(tkU, "GC") or str.startswith(tkU, "MGC")
+isNq  = str.contains(tkU, "NQ") or str.contains(tkU, "NAS") or str.contains(tkU, "US100") or str.contains(tkU, "USTEC") or str.contains(tkU, "NDX") or str.contains(tkU, "USTECH")
+isFut = syminfo.type == "futures" or str.contains(tkU, "1!")
+inst  = iPreset == "Nasdaq" ? "NQ" : iPreset == "Gold (XAUUSD)" ? "XAU" : iPreset == "Custom" ? "CUSTOM" : isAu ? "XAU" : isNq ? "NQ" : "CUSTOM"
+// killzones (New York time)
+//   Nasdaq: London 02-05 · NY AM 08:30-11 (data + cash open) · NY PM 13:30-16
+//   Gold  : London 02-05 · NY AM 08:20-11 (COMEX open)       · NY PM 13:30-15
+kz1 = inst == "CUSTOM" ? iKz1 : "0200-0500"
+kz2 = inst == "XAU" ? "0820-1100" : inst == "NQ" ? "0830-1100" : iKz2
+kz3 = inst == "XAU" ? "1330-1500" : inst == "NQ" ? "1330-1600" : iKz3
+// SMT pair (positively correlated)
+smtAuto = inst == "NQ" ? (isFut ? "CME_MINI:ES1!" : "OANDA:SPX500USD") : inst == "XAU" ? (isFut ? "COMEX:SI1!" : "OANDA:XAGUSD") : ""
+smtSym  = iSmtSym != "" ? iSmtSym : smtAuto
+instName = inst == "NQ" ? "NASDAQ" : inst == "XAU" ? "GOLD" : "CUSTOM"
 
 // ─────────────────────────────────────────────────────────────── HELPERS ────
 f_tfName(string tf) =>
@@ -423,8 +445,10 @@ biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = ba
 [nyH, nyHt, nyL, nyLt, inNy]   = f_session(iNy, iTz)
 
 // SMT divergence vs correlated symbol
-smtOn = iSmtSym != "" and iSmtMode != "Off"
-[oH, oL] = request.security(iSmtSym == "" ? syminfo.tickerid : iSmtSym, timeframe.period, [high, low])
+smtOn = smtSym != "" and iSmtMode != "Off"
+[oHraw, oLraw] = request.security(smtSym == "" ? syminfo.tickerid : smtSym, timeframe.period, [high, low], ignore_invalid_symbol = true)
+oH = nz(oHraw, high)
+oL = nz(oLraw, low)
 ourHH = high >= nz(ta.highest(high, iSmtLen)[1], high)
 ourLL = low <= nz(ta.lowest(low, iSmtLen)[1], low)
 othHH = oH >= nz(ta.highest(oH, iSmtLen)[1], oH)
@@ -464,7 +488,7 @@ mu    = ta.sma(chg, 200)
 // killzones / news windows (filters only, nothing drawn)
 f_in(string sess) =>
     not na(time(timeframe.period, sess, iTz))
-inKZ   = f_in(iKz1) or f_in(iKz2) or f_in(iKz3)
+inKZ   = f_in(kz1) or f_in(kz2) or f_in(kz3)
 inNews = f_in(iNews1) or f_in(iNews2) or f_in(iNews3)
 
 f_pot(float dist, int dir) =>
@@ -1046,7 +1070,7 @@ if barstate.islast
     // ── HUD
     if iShowHud
         table.clear(hud, 0, 0, 1, 18)
-        f_hud(0, "DOL ENGINE PRO", f_tfName(timeframe.period), cAcc, cMute, cBg)
+        f_hud(0, "DOL ENGINE PRO", instName + " · " + f_tfName(timeframe.period), cAcc, cMute, cBg)
         int   si   = primI >= 0 ? primI : bestI
         bool  live = primI >= 0
         if si >= 0
