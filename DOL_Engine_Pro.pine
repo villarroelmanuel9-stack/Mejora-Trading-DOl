@@ -53,13 +53,32 @@ iOffset     = input.int(30, "Right Offset (bars)", minval = 5, maxval = 200, gro
 grpX = "🎯 Entry Signals (at DOL)"
 iShowSig  = input.bool(true, "Show BUY / SELL at DOL", group = grpX,
      tooltip = "DOL above reached → SELL (buy-side liquidity taken). DOL below reached → BUY (sell-side liquidity taken). Fires when a candle closes back through the swept level.")
-iSigMode  = input.string("Rejection", "Confirmation", options = ["Rejection", "Rejection + Displacement"], group = grpX,
-     tooltip = "Rejection: close back through the DOL level. Displacement: also requires a strong body (≥ 0.5 × chart ATR).")
-iSigBars  = input.int(15, "Bars to Confirm After Sweep", minval = 1, maxval = 100, group = grpX)
+iSigMode  = input.string("Rejection + MSS", "Confirmation", options = ["Rejection", "Rejection + Displacement", "Rejection + MSS"], group = grpX,
+     tooltip = "Rejection: close back through the DOL level. Displacement: also a strong body (≥ 0.5 × chart ATR). MSS: also a close beyond the last 1m swing (market structure shift) — safest.")
+iMssLen   = input.int(2, "MSS Swing Length (1m)", minval = 1, maxval = 10, group = grpX)
+iSigBars  = input.int(20, "Bars to Confirm After Sweep", minval = 1, maxval = 100, group = grpX)
+iMinRR    = input.float(1.5, "Min RR to Signal", minval = 0.0, step = 0.25, group = grpX)
 iSlBuf    = input.float(0.10, "SL Buffer (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpX)
 iRR       = input.float(2.0, "Fallback TP (R multiple)", minval = 0.5, step = 0.5, group = grpX)
 iSigLines = input.bool(true, "Show Entry / SL / TP", group = grpX)
 iMaxSig   = input.int(15, "Max Signals Kept", minval = 1, maxval = 50, group = grpX)
+
+grpSF = "🛡 Safety Filters (no extra drawings)"
+iUseKZ   = input.bool(true, "Signals only inside Killzones", group = grpSF)
+iKz1     = input.session("0200-0500", "Killzone London", group = grpSF)
+iKz2     = input.session("0830-1100", "Killzone NY AM", group = grpSF)
+iKz3     = input.session("1330-1600", "Killzone NY PM", group = grpSF)
+iUseNews = input.bool(true, "Block Signals in News Windows", group = grpSF)
+iNews1   = input.session("0825-0840", "News Window 1", group = grpSF)
+iNews2   = input.session("0955-1005", "News Window 2", group = grpSF)
+iNews3   = input.session("1355-1410", "News Window 3", group = grpSF)
+iUsePD   = input.bool(true, "Premium / Discount Filter", group = grpSF,
+     tooltip = "SELL only if the sweep happened in premium (above the 2-day range midpoint), BUY only in discount.")
+iSmtSym  = input.symbol("", "SMT Symbol (e.g. ES1! for NQ1!)", group = grpSF)
+iSmtMode = input.string("Bonus", "SMT Divergence", options = ["Off", "Bonus", "Required"], group = grpSF)
+iSmtLen  = input.int(30, "SMT Lookback (bars)", minval = 5, maxval = 200, group = grpSF)
+iConsPoT = input.bool(true, "Conservative PoT", group = grpSF,
+     tooltip = "Ignores favourable drift, trims volatility 15 % and reduces it outside killzones → PoT is harder to inflate.")
 
 grpH = "📊 HUD"
 iShowHud = input.bool(true, "Show HUD", group = grpH)
@@ -389,6 +408,26 @@ biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = ba
 [lnH, lnHt, lnL, lnLt, inLon]  = f_session(iLon, iTz)
 [nyH, nyHt, nyL, nyLt, inNy]   = f_session(iNy, iTz)
 
+// SMT divergence vs correlated symbol
+smtOn = iSmtSym != "" and iSmtMode != "Off"
+[oH, oL] = request.security(iSmtSym == "" ? syminfo.tickerid : iSmtSym, timeframe.period, [high, low])
+ourHH = high >= nz(ta.highest(high, iSmtLen)[1], high)
+ourLL = low <= nz(ta.lowest(low, iSmtLen)[1], low)
+othHH = oH >= nz(ta.highest(oH, iSmtLen)[1], oH)
+othLL = oL <= nz(ta.lowest(oL, iSmtLen)[1], oL)
+smtBear = smtOn and ourHH and not othHH      // we took highs, they did not
+smtBull = smtOn and ourLL and not othLL
+
+// 1m micro swings for MSS confirmation
+mpH = ta.pivothigh(high, iMssLen, iMssLen)
+mpL = ta.pivotlow(low, iMssLen, iMssLen)
+var float microH = na
+var float microL = na
+if not na(mpH)
+    microH := mpH
+if not na(mpL)
+    microL := mpL
+
 var float dayOpen = na
 if timeframe.change("D")
     dayOpen := open
@@ -408,11 +447,21 @@ chg   = close - close[1]
 sigma = ta.stdev(chg, 200)
 mu    = ta.sma(chg, 200)
 
+// killzones / news windows (filters only, nothing drawn)
+f_in(string sess) =>
+    not na(time(timeframe.period, sess, iTz))
+inKZ   = f_in(iKz1) or f_in(iKz2) or f_in(iKz3)
+inNews = f_in(iNews1) or f_in(iNews2) or f_in(iNews3)
+
 f_pot(float dist, int dir) =>
     float s = nz(sigma) * math.sqrt(iHorizon)
+    if iConsPoT
+        s := s * 0.85 * (inKZ ? 1.0 : 0.8)
     float r = 0.0
     if s > 0
         float m = nz(mu) * dir * 0.5
+        if iConsPoT
+            m := math.min(0.0, m)        // only adverse drift counts
         float e = math.min(50.0, 2.0 * m * dist / (sigma * sigma))
         r := f_ncdf((-dist + m * iHorizon) / s) + math.exp(e) * f_ncdf((-dist - m * iHorizon) / s)
     math.min(95.0, 100.0 * math.min(1.0, r))
@@ -608,6 +657,9 @@ var float armLvl = na
 var float armExt = na
 var int   armBar = na
 var string armName = ""
+var float armMss = na
+var bool  armPD  = true
+var bool  armSmt = false
 var array<label> sigLbls  = array.new<label>()
 var array<line>  sigLines = array.new<line>()
 bool evBuy  = false
@@ -624,11 +676,42 @@ if iShowSig and barstate.isconfirmed and doScore
         armExt  := sweptDir == 1 ? high : low
         armBar  := bar_index
         armName := sweptName
+        armMss  := armDir == -1 ? microL : microH
+        float rngHi = math.max(nz(pdh, runHiD), runHiD)
+        float rngLo = math.min(nz(pdl, runLoD), runLoD)
+        float rngMid = (rngHi + rngLo) / 2.0
+        armPD   := armDir == -1 ? high > rngMid : low < rngMid
+        armSmt  := false
     if armDir != 0
         armExt := armDir == -1 ? math.max(armExt, high) : math.min(armExt, low)
-        bool disp = iSigMode == "Rejection" or math.abs(close - open) >= 0.5 * atrChart
-        bool sell = armDir == -1 and close < armLvl and close < open and disp
-        bool buy  = armDir == 1 and close > armLvl and close > open and disp
+        armSmt := armSmt or (armDir == -1 ? smtBear : smtBull)
+        bool dispOk = math.abs(close - open) >= 0.5 * atrChart
+        bool mssOk  = na(armMss) ? true : armDir == -1 ? close < armMss : close > armMss
+        bool modeOk = iSigMode == "Rejection" ? true : iSigMode == "Rejection + Displacement" ? dispOk : mssOk
+        bool kzOk   = not iUseKZ or inKZ
+        bool newsOk = not iUseNews or not inNews
+        bool pdOk   = not iUsePD or armPD
+        bool smtOk  = not smtOn or iSmtMode != "Required" or armSmt
+        bool gates  = modeOk and kzOk and newsOk and pdOk and smtOk
+        bool sell = armDir == -1 and close < armLvl and close < open and gates
+        bool buy  = armDir == 1 and close > armLvl and close > open and gates
+        // RR check before firing
+        float preSL = armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
+        float preRisk = math.abs(close - preSL)
+        float preTP = na
+        float preBest = 1e10
+        if (sell or buy) and nC > 0
+            for i = 0 to nC - 1
+                Cand c = cs.get(i)
+                float e = f_edge(c)
+                if c.dir == armDir and math.abs(e - close) > 0.5 * preRisk and math.abs(e - close) < preBest
+                    preBest := math.abs(e - close)
+                    preTP   := e
+        if na(preTP)
+            preTP := close + armDir * iRR * preRisk
+        bool rrOk = preRisk > 0 and math.abs(preTP - close) / preRisk >= iMinRR
+        sell := sell and rrOk
+        buy  := buy and rrOk
         if sell or buy
             sigEntry := close
             sigSL    := armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
@@ -647,7 +730,8 @@ if iShowSig and barstate.isconfirmed and doScore
             float rr = risk > 0 ? math.abs(sigTP - sigEntry) / risk : 0.0
             evSell := sell
             evBuy  := buy
-            string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " · RR " + str.tostring(rr, "#.0")
+            int safety = (inKZ ? 1 : 0) + (mssOk ? 1 : 0) + (dispOk ? 1 : 0) + (armPD ? 1 : 0) + (armSmt ? 1 : 0)
+            string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " · RR " + str.tostring(rr, "#.0") + " · ★" + str.tostring(safety) + "/5"
             sigLbls.push(label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
                  color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace))
             if iSigLines

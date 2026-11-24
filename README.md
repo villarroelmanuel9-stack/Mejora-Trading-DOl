@@ -11,6 +11,15 @@ Diseñado para usarse en el **gráfico de 1 minuto**. Los objetivos de liquidez 
 - **Niveles de liquidez**: PDH/PDL, PWH/PWL, ASIA-H/L, LON-H/L, NY-H/L, BSL/SSL y EQH/EQL de 1H y 15m.
 - **Zonas FVG** de 1H y 15m (BFVG alcista, SFVG bajista), con relleno parcial, y el **+ ANCHOR FVG** en el lado opuesto al objetivo.
 - **Señales BUY / SELL en el DOL** (ámbar): cuando el precio alcanza un DOL **arriba** se prepara una **SELL** (barrida de liquidez compradora); si el DOL está **abajo**, una **BUY**. La señal sale cuando una vela cierra de vuelta al otro lado del nivel (rechazo), dentro de las 15 velas siguientes, y queda opcionalmente filtrada por desplazamiento. Marca la entrada, el **SL** (extremo de la barrida más un margen) y el **TP** (siguiente liquidez del lado contrario o 2R), con el RR en la etiqueta. Tiene alertas *BUY at DOL* y *SELL at DOL*.
+- **Filtros de seguridad** (internos, sin dibujar nada nuevo):
+  - Killzones: solo hay señales en Londres (2–5), NY AM (8:30–11) y NY PM (13:30–16).
+  - Ventanas de noticias bloqueadas: 8:25–8:40, 9:55–10:05 y 13:55–14:10.
+  - Confirmación por **MSS en 1m**: después de la barrida, una vela tiene que cerrar más allá del último swing de 1m.
+  - Filtro **premium / discount** (rango de 2 días): SELL solo en premium, BUY solo en discount.
+  - **RR mínimo** de 1.5.
+  - **Divergencia SMT** opcional, comparando con otro símbolo (por ejemplo ES1! para NQ1!).
+  - **PoT conservador**: no cuenta la deriva a favor, recorta la volatilidad un 15% y la reduce fuera de las killzones.
+  - La etiqueta muestra `★n/5`: cuántas confluencias se cumplieron (killzone, MSS, desplazamiento, premium/discount, SMT).
 - Opcional: BOS / MSS en el gráfico y barras de desequilibrio de order flow.
 
 ### Confirmación (0–100)
