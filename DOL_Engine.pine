@@ -1,0 +1,668 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  DOL Engine · Liquidity Compass
+//  Draw-on-Liquidity scoring engine built on ICT / Smart-Money concepts:
+//    • Market structure (BOS / CHoCH, body-close confirmation)
+//    • Buy-side / Sell-side liquidity (swing highs/lows, EQH / EQL)
+//    • Order Blocks → Breakers
+//    • Fair Value Gaps → Inversion FVGs (partial-fill tracking)
+//    • PDH / PDL / PWH / PWL key levels
+//    • Order-flow estimate (bar delta, rolling CVD, RVOL imbalances)
+//    • 0-100 score (Proximity · Freshness · Confluence · Density) + PoT %
+//    • Multi-timeframe bias dashboard
+//  Structural logic runs only on confirmed bars (no repaint).
+//  Educational tool — not financial advice.
+// ════════════════════════════════════════════════════════════════════════════
+indicator("DOL Engine · Liquidity Compass", shorttitle = "DOL Engine", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+
+// ─────────────────────────────────────────────────────────────── KINDS ──────
+// even = bullish / buy-side, odd = bearish / sell-side
+K_BSL   = 0
+K_SSL   = 1
+K_FVGB  = 2
+K_FVGS  = 3
+K_IFVGB = 4
+K_IFVGS = 5
+K_OBB   = 6
+K_OBS   = 7
+K_BRKB  = 8
+K_BRKS  = 9
+K_PDH   = 10
+K_PDL   = 11
+
+// ─────────────────────────────────────────────────────────────── INPUTS ─────
+grpG = "⚙ General"
+iMode      = input.string("Day Trading", "Trading Mode", options = ["Swing", "Day Trading", "Scalping"], group = grpG,
+     tooltip = "Swing: D / 4H / 1H · Day Trading: 4H / 1H / 15m · Scalping: 1H / 15m / 5m")
+iSwingLen  = input.int(5, "Swing Length (pivots)", minval = 2, maxval = 50, group = grpG)
+iMaxPool   = input.int(40, "Max Candidates in Pool", minval = 10, maxval = 80, group = grpG)
+iMaxAge    = input.int(600, "Max Zone Age (bars)", minval = 50, group = grpG)
+
+grpS = "🎯 DOL Scoring"
+iMaxATR    = input.float(8.0, "Max ATR Distance", minval = 1.0, step = 0.5, group = grpS)
+iHalfLife  = input.int(120, "Freshness Half-Life (bars)", minval = 10, group = grpS)
+iMinPoT    = input.float(0.0, "Minimum PoT to Show DOL (%)", minval = 0.0, maxval = 95.0, step = 1.0, group = grpS)
+iMinScore  = input.int(0, "Minimum Score to Show DOL", minval = 0, maxval = 100, group = grpS)
+iShowAlt   = input.bool(true, "Show Opposite-Side Target", group = grpS)
+iConnector = input.bool(true, "Show Draw Connector", group = grpS)
+iGhosts    = input.int(8, "Ghost Trail (swept DOLs kept)", minval = 0, maxval = 50, group = grpS)
+
+grpZ = "🧱 ICT Zones"
+iShowLiq   = input.bool(true, "BSL / SSL", group = grpZ, inline = "liq")
+iShowPD    = input.bool(true, "PDH / PDL", group = grpZ, inline = "liq")
+iShowOB    = input.bool(true, "Order Blocks", group = grpZ, inline = "ob")
+iShowBRK   = input.bool(true, "Breakers", group = grpZ, inline = "ob")
+iShowFVG   = input.bool(true, "FVG", group = grpZ, inline = "fvg")
+iShowIFVG  = input.bool(true, "Inversion FVG", group = grpZ, inline = "fvg")
+iFvgMinATR = input.float(0.15, "Min FVG Size (×ATR)", minval = 0.0, step = 0.05, group = grpZ)
+iEqTol     = input.float(0.10, "Equal Highs/Lows Tolerance (×ATR)", minval = 0.01, step = 0.01, group = grpZ)
+
+grpM = "📐 Structure"
+iShowMS    = input.bool(true, "BOS / CHoCH", group = grpM)
+iShowEQ    = input.bool(true, "Equilibrium (Premium / Discount)", group = grpM)
+
+grpF = "🌊 Order Flow"
+iFlowLen   = input.int(20, "Delta Lookback (bars)", minval = 5, group = grpF)
+iShowImb   = input.bool(true, "Mark Volume Imbalance Bars", group = grpF)
+iImbRvol   = input.float(2.0, "Imbalance RVOL ≥", minval = 1.0, step = 0.1, group = grpF)
+
+grpT = "📊 Dashboard"
+iShowTbl   = input.bool(true, "Show Dashboard", group = grpT)
+iTblPos    = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpT)
+iTblSize   = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = grpT)
+
+grpC = "🎨 Theme"
+cBull = input.color(#00E5FF, "Buy-side / Bullish", group = grpC)
+cBear = input.color(#FF2E88, "Sell-side / Bearish", group = grpC)
+cDol  = input.color(#FFC400, "DOL Target", group = grpC)
+cNeut = input.color(#5D6B82, "Neutral / Mitigated", group = grpC)
+cBg   = input.color(#0B0F17, "Dashboard Background", group = grpC)
+cText = input.color(#D7E1F0, "Text", group = grpC)
+
+CLEAR = #00000000
+
+// ─────────────────────────────────────────────────────────── TIMEFRAMES ─────
+tfH = iMode == "Swing" ? "D"   : iMode == "Day Trading" ? "240" : "60"
+tfM = iMode == "Swing" ? "240" : iMode == "Day Trading" ? "60"  : "15"
+tfL = iMode == "Swing" ? "60"  : iMode == "Day Trading" ? "15"  : "5"
+
+f_tfSafe(string tf) =>
+    timeframe.in_seconds(tf) < timeframe.in_seconds(timeframe.period) ? timeframe.period : tf
+
+f_tfName(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 ? "W" : s >= 86400 ? "D" : s >= 3600 ? str.tostring(int(s / 3600)) + "H" : str.tostring(int(s / 60)) + "m"
+
+// ─────────────────────────────────────────────────────────── MARKET DATA ────
+atrN    = math.max(nz(ta.atr(14), high - low), syminfo.mintick)
+vol     = nz(volume, 1.0)
+volAvg  = ta.sma(vol, 20)
+rvol    = volAvg > 0 ? vol / volAvg : 1.0
+barRng  = high - low
+buyV    = barRng > 0 ? vol * (close - low) / barRng : vol * 0.5
+delta   = 2.0 * buyV - vol                                   // estimated bar delta
+sDelta  = math.sum(delta, iFlowLen)                          // rolling CVD
+sVol    = math.sum(vol, iFlowLen)
+flowPct = sVol > 0 ? 50.0 + 50.0 * sDelta / sVol : 50.0      // % aggressive buyers
+flowDir = flowPct >= 55 ? 1 : flowPct <= 45 ? -1 : 0
+
+// HTF bias from confirmed pivots, broken by candle BODY close
+f_bias(int len) =>
+    var int   t  = 0
+    var float sh = na
+    var float sl = na
+    float ph_ = ta.pivothigh(high, len, len)
+    float pl_ = ta.pivotlow(low, len, len)
+    if not na(ph_)
+        sh := ph_
+    if not na(pl_)
+        sl := pl_
+    if not na(sh) and close > sh
+        t  := 1
+        sh := na
+    if not na(sl) and close < sl
+        t  := -1
+        sl := na
+    t
+
+f_biasConfirmed(int len) =>
+    int b = f_bias(len)
+    b[1]
+
+biasH = nz(request.security(syminfo.tickerid, f_tfSafe(tfH), f_biasConfirmed(iSwingLen), lookahead = barmerge.lookahead_on))
+biasM = nz(request.security(syminfo.tickerid, f_tfSafe(tfM), f_biasConfirmed(iSwingLen), lookahead = barmerge.lookahead_on))
+biasL = nz(request.security(syminfo.tickerid, f_tfSafe(tfL), f_biasConfirmed(iSwingLen), lookahead = barmerge.lookahead_on))
+
+[pdhS, pdlS] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwhS, pwlS] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+newDay = timeframe.change("D")
+
+// ─────────────────────────────────────────────────────────────── HELPERS ────
+var KIND_NAMES = array.from("BSL", "SSL", "+FVG", "-FVG", "+iFVG", "-iFVG", "+OB", "-OB", "+BRK", "-BRK", "PDH", "PDL")
+
+f_kindName(int k) =>
+    KIND_NAMES.get(k)
+
+f_kindColor(int k) =>
+    k % 2 == 0 ? cBull : cBear
+
+f_isLine(int k) =>
+    k <= K_SSL or k >= K_PDH
+
+f_enabled(int k) =>
+    k <= K_SSL ? iShowLiq : k <= K_FVGS ? iShowFVG : k <= K_IFVGS ? iShowIFVG : k <= K_OBS ? iShowOB : k <= K_BRKS ? iShowBRK : iShowPD
+
+f_box(int x1, float top, float btm, int k) =>
+    color c = f_kindColor(k)
+    box.new(x1, top, bar_index, btm, border_color = color.new(c, 55), border_width = 1, bgcolor = color.new(c, 88),
+         text = f_kindName(k), text_size = size.tiny, text_color = color.new(c, 25), text_halign = text.align_right,
+         text_valign = text.align_center, text_font_family = font.family_monospace)
+
+f_nearKey(float lvl, float tol) =>
+    math.abs(lvl - pdhS) <= tol or math.abs(lvl - pdlS) <= tol or math.abs(lvl - pwhS) <= tol or math.abs(lvl - pwlS) <= tol
+
+f_biasTxt(int b) =>
+    b == 1 ? "▲ BULL" : b == -1 ? "▼ BEAR" : "◆ NEUTRAL"
+
+f_biasCol(int b) =>
+    b == 1 ? cBull : b == -1 ? cBear : cNeut
+
+f_scoreBar(float sc) =>
+    int n = int(math.round(math.max(0.0, math.min(100.0, sc)) / 10.0))
+    str.repeat("■", n) + str.repeat("□", 10 - n)
+
+f_pos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+tblSize = iTblSize == "Tiny" ? size.tiny : iTblSize == "Normal" ? size.normal : size.small
+
+// ───────────────────────────────────────────────────────── LIQUIDITY UDT ────
+type Liq
+    int   uid
+    int   kind
+    float top
+    float btm
+    int   born           // left edge of the drawing (origin candle)
+    int   created        // bar the candidate was confirmed (freshness clock)
+    float dens           // density pillar 0-15
+    int   touches = 0
+    int   eq      = 1    // equal highs / lows count
+    float score   = 0.0
+    float pot     = 0.0
+    box   bx      = na
+    line  ln      = na
+    label lb      = na
+
+method kill(Liq this) =>
+    if not na(this.bx)
+        this.bx.delete()
+    if not na(this.ln)
+        this.ln.delete()
+    if not na(this.lb)
+        this.lb.delete()
+    this
+
+method extend(Liq this, int x) =>
+    if not na(this.bx)
+        this.bx.set_lefttop(this.born, this.top)
+        this.bx.set_rightbottom(x, this.btm)
+    if not na(this.ln)
+        this.ln.set_x2(x)
+    if not na(this.lb)
+        this.lb.set_x(x)
+    this
+
+method markTouched(Liq this) =>
+    this.touches := this.touches + 1
+    if this.touches == 1 and not na(this.bx)
+        color c = f_kindColor(this.kind)
+        this.bx.set_bgcolor(color.new(c, 94))
+        this.bx.set_border_color(color.new(c, 75))
+    this
+
+// FVG → iFVG, OB → Breaker: new identity, flipped colour
+method flip(Liq this) =>
+    this.uid     := bar_index * 16 + this.kind
+    this.created := bar_index
+    this.touches := 0
+    if f_enabled(this.kind)
+        if na(this.bx)
+            this.bx := f_box(this.born, this.top, this.btm, this.kind)
+        else
+            color c = f_kindColor(this.kind)
+            this.bx.set_bgcolor(color.new(c, 88))
+            this.bx.set_border_color(color.new(c, 45))
+            this.bx.set_text(f_kindName(this.kind))
+            this.bx.set_text_color(color.new(c, 25))
+        this.bx.set_border_style(line.style_dashed)
+    else if not na(this.bx)
+        this.bx.delete()
+        this.bx := na
+    this
+
+f_make(int k, float top, float btm, int born, float dens) =>
+    Liq z = Liq.new(uid = bar_index * 16 + k, kind = k, top = top, btm = btm, born = born, created = bar_index, dens = dens)
+    if f_enabled(k)
+        if f_isLine(k)
+            color c = f_kindColor(k)
+            z.ln := line.new(born, top, bar_index, top, color = color.new(c, 25), width = 1)
+            z.lb := label.new(bar_index, top, f_kindName(k), style = label.style_label_left, color = CLEAR,
+                 textcolor = color.new(c, 15), size = size.tiny, text_font_family = font.family_monospace)
+        else
+            z.bx := f_box(born, top, btm, k)
+    z
+
+method addLiq(array<Liq> p, Liq z) =>
+    p.push(z)
+    if p.size() > iMaxPool
+        p.shift().kill()
+    p
+
+// ──────────────────────────────────────────────────────────────── STATE ─────
+ph = ta.pivothigh(high, iSwingLen, iSwingLen)
+pl = ta.pivotlow(low, iSwingLen, iSwingLen)
+
+var array<Liq>   pool       = array.new<Liq>()
+var array<line>  sweptLines = array.new<line>()
+var array<line>  ghostLines = array.new<line>()
+var array<label> ghostLbls  = array.new<label>()
+var array<line>  msLines    = array.new<line>()
+var array<label> msLbls     = array.new<label>()
+
+var float swH     = na
+var int   swHBar  = na
+var bool  swHUsed = true
+var float swL     = na
+var int   swLBar  = na
+var bool  swLUsed = true
+var int   trend   = 0
+var int   primUid = -1
+
+bool   evNew   = false
+bool   evSwept = false
+bool   evIFVG  = false
+bool   evMS    = false
+string msTag   = ""
+
+// ───────────────────────────────────────────────── 1 · LIFECYCLE (closed bar)
+if barstate.isconfirmed and pool.size() > 0
+    for i = pool.size() - 1 to 0
+        Liq  z       = pool.get(i)
+        int  k       = z.kind
+        bool touched = high >= z.btm and low <= z.top
+        bool remove  = false
+        bool swept   = false
+
+        // primary DOL reached → ghost trail
+        if z.uid == primUid and touched
+            evSwept := true
+            if iGhosts > 0
+                float lvl = close[1] < z.btm ? z.btm : z.top
+                ghostLines.push(line.new(z.born, lvl, bar_index, lvl, color = color.new(cDol, 35), style = line.style_dotted, width = 2))
+                ghostLbls.push(label.new(bar_index, lvl, "✓ DOL " + f_kindName(k), style = label.style_label_left, color = CLEAR,
+                     textcolor = color.new(cDol, 30), size = size.tiny, text_font_family = font.family_monospace))
+                if ghostLines.size() > iGhosts
+                    ghostLines.shift().delete()
+                    ghostLbls.shift().delete()
+
+        if k == K_BSL or k == K_PDH
+            if high > z.top
+                remove := true
+                swept  := true
+        else if k == K_SSL or k == K_PDL
+            if low < z.btm
+                remove := true
+                swept  := true
+        else if k == K_FVGB
+            if close < z.btm
+                z.kind := K_IFVGS
+                z.flip()
+                evIFVG := true
+            else if low <= z.btm
+                remove := true
+            else if low < z.top
+                z.top := low                      // partial fill
+                z.markTouched()
+        else if k == K_FVGS
+            if close > z.top
+                z.kind := K_IFVGB
+                z.flip()
+                evIFVG := true
+            else if high >= z.top
+                remove := true
+            else if high > z.btm
+                z.btm := high
+                z.markTouched()
+        else if k == K_OBB
+            if close < z.btm
+                z.kind := K_BRKS
+                z.flip()
+            else if touched
+                z.markTouched()
+        else if k == K_OBS
+            if close > z.top
+                z.kind := K_BRKB
+                z.flip()
+            else if touched
+                z.markTouched()
+        else if k == K_BRKB or k == K_IFVGB
+            if close < z.btm
+                remove := true
+            else if touched
+                z.markTouched()
+        else if k == K_BRKS or k == K_IFVGS
+            if close > z.top
+                remove := true
+            else if touched
+                z.markTouched()
+
+        if bar_index - z.created > iMaxAge
+            remove := true
+
+        if remove
+            if swept and not na(z.ln)
+                z.ln.set_x2(bar_index)
+                z.ln.set_style(line.style_dotted)
+                z.ln.set_color(color.new(cNeut, 30))
+                sweptLines.push(z.ln)
+                z.ln := na
+                if sweptLines.size() > 40
+                    sweptLines.shift().delete()
+            z.kill()
+            pool.remove(i)
+        else
+            z.extend(bar_index)
+
+// ─────────────────────────────────────── 2 · STRUCTURE & NEW CANDIDATES ─────
+if barstate.isconfirmed
+    // ── swing highs → BSL / EQH
+    if not na(ph)
+        swH     := ph
+        swHBar  := bar_index - iSwingLen
+        swHUsed := false
+        bool merged = false
+        if pool.size() > 0
+            for i = 0 to pool.size() - 1
+                Liq z = pool.get(i)
+                if z.kind == K_BSL and math.abs(z.top - ph) <= iEqTol * atrN
+                    z.eq   := z.eq + 1
+                    z.dens := math.min(15.0, z.dens + 5.0)
+                    z.top  := math.max(z.top, ph)
+                    z.btm  := z.top
+                    if not na(z.ln)
+                        z.ln.set_y1(z.top)
+                        z.ln.set_y2(z.top)
+                    if not na(z.lb)
+                        z.lb.set_y(z.top)
+                        z.lb.set_text("EQH ×" + str.tostring(z.eq))
+                    merged := true
+                    break
+        if not merged
+            pool.addLiq(f_make(K_BSL, ph, ph, swHBar, 5.0))
+
+    // ── swing lows → SSL / EQL
+    if not na(pl)
+        swL     := pl
+        swLBar  := bar_index - iSwingLen
+        swLUsed := false
+        bool merged = false
+        if pool.size() > 0
+            for i = 0 to pool.size() - 1
+                Liq z = pool.get(i)
+                if z.kind == K_SSL and math.abs(z.btm - pl) <= iEqTol * atrN
+                    z.eq   := z.eq + 1
+                    z.dens := math.min(15.0, z.dens + 5.0)
+                    z.btm  := math.min(z.btm, pl)
+                    z.top  := z.btm
+                    if not na(z.ln)
+                        z.ln.set_y1(z.btm)
+                        z.ln.set_y2(z.btm)
+                    if not na(z.lb)
+                        z.lb.set_y(z.btm)
+                        z.lb.set_text("EQL ×" + str.tostring(z.eq))
+                    merged := true
+                    break
+        if not merged
+            pool.addLiq(f_make(K_SSL, pl, pl, swLBar, 5.0))
+
+    // ── bullish break (body close above swing high)
+    if not na(swH) and not swHUsed and close > swH
+        swHUsed := true
+        msTag   := trend < 0 ? "CHoCH" : "BOS"
+        trend   := 1
+        evMS    := true
+        if iShowMS
+            msLines.push(line.new(swHBar, swH, bar_index, swH, color = color.new(cBull, 20), style = line.style_dashed, width = 1))
+            msLbls.push(label.new(int((swHBar + bar_index) / 2), swH, msTag, style = label.style_label_down, color = CLEAR,
+                 textcolor = cBull, size = size.tiny, text_font_family = font.family_monospace))
+            if msLines.size() > 40
+                msLines.shift().delete()
+                msLbls.shift().delete()
+        // Bullish OB = candle with the lowest low of the leg that broke structure
+        int n = math.min(bar_index - swHBar, 100)
+        if n >= 1
+            float mn  = low[1]
+            int   idx = 1
+            for j = 1 to n
+                if low[j] < mn
+                    mn  := low[j]
+                    idx := j
+            pool.addLiq(f_make(K_OBB, high[idx], low[idx], bar_index - idx, math.min(15.0, 5.0 * nz(rvol[idx], 1.0))))
+
+    // ── bearish break (body close below swing low)
+    if not na(swL) and not swLUsed and close < swL
+        swLUsed := true
+        msTag   := trend > 0 ? "CHoCH" : "BOS"
+        trend   := -1
+        evMS    := true
+        if iShowMS
+            msLines.push(line.new(swLBar, swL, bar_index, swL, color = color.new(cBear, 20), style = line.style_dashed, width = 1))
+            msLbls.push(label.new(int((swLBar + bar_index) / 2), swL, msTag, style = label.style_label_up, color = CLEAR,
+                 textcolor = cBear, size = size.tiny, text_font_family = font.family_monospace))
+            if msLines.size() > 40
+                msLines.shift().delete()
+                msLbls.shift().delete()
+        int n = math.min(bar_index - swLBar, 100)
+        if n >= 1
+            float mx  = high[1]
+            int   idx = 1
+            for j = 1 to n
+                if high[j] > mx
+                    mx  := high[j]
+                    idx := j
+            pool.addLiq(f_make(K_OBS, high[idx], low[idx], bar_index - idx, math.min(15.0, 5.0 * nz(rvol[idx], 1.0))))
+
+    // ── Fair Value Gaps (3-candle imbalance)
+    float gapUp = low - high[2]
+    if low > high[2] and close[1] > high[2] and gapUp >= iFvgMinATR * atrN
+        pool.addLiq(f_make(K_FVGB, low, high[2], bar_index - 1, math.min(15.0, 10.0 * gapUp / atrN)))
+    float gapDn = low[2] - high
+    if high < low[2] and close[1] < low[2] and gapDn >= iFvgMinATR * atrN
+        pool.addLiq(f_make(K_FVGS, low[2], high, bar_index - 1, math.min(15.0, 10.0 * gapDn / atrN)))
+
+    // ── Previous day high / low (intraday charts)
+    if timeframe.isintraday and newDay and not na(pdhS) and not na(pdlS)
+        if pool.size() > 0
+            for i = pool.size() - 1 to 0
+                Liq z = pool.get(i)
+                if z.kind == K_PDH or z.kind == K_PDL
+                    z.kill()
+                    pool.remove(i)
+        pool.addLiq(f_make(K_PDH, pdhS, pdhS, bar_index, 8.0))
+        pool.addLiq(f_make(K_PDL, pdlS, pdlS, bar_index, 8.0))
+
+// ─────────────────────────────────────────────── 3 · SCORING (every tick) ───
+//  Proximity 35 · Freshness 25 · Confluence 25 · Density 15  = 100
+float eqLvl = not na(swH) and not na(swL) ? (swH + swL) / 2.0 : na
+float bestSc = -1.0
+int   bestI  = -1
+float altSc  = -1.0
+int   altI   = -1
+int   bestDir = 0
+
+if pool.size() > 0
+    for i = 0 to pool.size() - 1
+        Liq z = pool.get(i)
+        z.score := 0.0
+        z.pot   := 0.0
+        bool above = z.btm > close
+        bool below = z.top < close
+        if z.touches == 0 and (above or below) and f_enabled(z.kind)
+            int   dir  = above ? 1 : -1
+            float edge = above ? z.btm : z.top
+            float d    = math.abs(edge - close) / atrN
+            if d <= iMaxATR
+                float prox  = 35.0 * (1.0 - d / iMaxATR)
+                float fresh = 25.0 * math.pow(0.5, float(bar_index - z.created) / iHalfLife)
+                float conf  = biasH == dir ? 10.0 : biasH == 0 ? 4.0 : 0.0
+                conf += f_nearKey(edge, 0.3 * atrN) ? 7.0 : 0.0
+                if not na(eqLvl)
+                    conf += (dir == 1 and close < eqLvl) or (dir == -1 and close > eqLvl) ? 4.0 : 0.0
+                conf += flowDir == dir ? 4.0 : 0.0
+                z.score := math.min(100.0, prox + fresh + conf + z.dens)
+                // Probability of Touch (heuristic, capped 95 %)
+                float base  = math.exp(-d / math.max(iMaxATR * 0.35, 0.5))
+                float align = biasH == dir ? 1.0 : biasH == 0 ? 0.85 : 0.65
+                float ofx   = flowDir == dir ? 1.08 : flowDir == -dir ? 0.92 : 1.0
+                z.pot := math.min(95.0, 100.0 * base * align * ofx)
+                if z.pot >= iMinPoT and z.score >= iMinScore and z.score > bestSc
+                    bestSc  := z.score
+                    bestI   := i
+                    bestDir := dir
+
+if bestI >= 0
+    for i = 0 to pool.size() - 1
+        Liq z = pool.get(i)
+        int zDir = z.btm > close ? 1 : z.top < close ? -1 : 0
+        if z.score > 0 and zDir == -bestDir and z.pot >= iMinPoT and z.score > altSc
+            altSc := z.score
+            altI  := i
+
+int bestUid = -1
+if bestI >= 0
+    bestUid := pool.get(bestI).uid
+
+if barstate.isconfirmed
+    if bestUid != -1 and bestUid != primUid
+        evNew := true
+    primUid := bestUid
+
+// ─────────────────────────────────────────────────────────── 4 · VISUALS ────
+var box   dolBox  = na
+var line  dolLine = na
+var line  dolConn = na
+var label dolLbl  = na
+var line  altLine = na
+var label altLbl  = na
+var line  eqLine  = na
+var label eqLbl   = na
+var table dash    = table.new(f_pos(iTblPos), 2, 15, bgcolor = cBg, border_color = color.new(cNeut, 70), border_width = 1,
+     frame_color = color.new(cDol, 40), frame_width = 1)
+
+f_cell(int r, string l, string v, color vc) =>
+    table.cell(dash, 0, r, l, text_color = color.new(cText, 35), text_halign = text.align_left, text_size = tblSize, text_font_family = font.family_monospace)
+    table.cell(dash, 1, r, v, text_color = vc, text_halign = text.align_right, text_size = tblSize, text_font_family = font.family_monospace)
+
+if barstate.islast
+    box.delete(dolBox)
+    line.delete(dolLine)
+    line.delete(dolConn)
+    label.delete(dolLbl)
+    line.delete(altLine)
+    label.delete(altLbl)
+    line.delete(eqLine)
+    label.delete(eqLbl)
+
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            pool.get(i).extend(bar_index + 3)
+
+    // ── primary DOL
+    if bestI >= 0
+        Liq   p    = pool.get(bestI)
+        bool  up   = bestDir == 1
+        float edge = up ? p.btm : p.top
+        int   xr   = bar_index + 25
+        if p.top - p.btm > syminfo.mintick
+            dolBox := box.new(p.born, p.top, xr, p.btm, border_color = cDol, border_width = 2, bgcolor = color.new(cDol, 85))
+        else
+            dolLine := line.new(p.born, p.top, xr, p.top, color = cDol, width = 2)
+        if iConnector
+            dolConn := line.new(bar_index, close, bar_index + 12, edge, color = color.new(cDol, 20), style = line.style_arrow_right, width = 1)
+        string txt = "◎ DOL " + (up ? "▲ " : "▼ ") + f_kindName(p.kind) + "\n" + str.tostring(edge, format.mintick) +
+             "\nScore " + str.tostring(p.score, "#") + " · PoT " + str.tostring(p.pot, "#.0") + "%"
+        dolLbl := label.new(xr, edge, txt, style = label.style_label_left, color = color.new(cBg, 10), textcolor = cDol,
+             size = size.small, textalign = text.align_left, text_font_family = font.family_monospace)
+
+    // ── opposite-side target
+    if iShowAlt and altI >= 0
+        Liq   a     = pool.get(altI)
+        float aEdge = a.btm > close ? a.btm : a.top
+        altLine := line.new(a.born, aEdge, bar_index + 15, aEdge, color = color.new(cText, 45), style = line.style_dashed, width = 1)
+        altLbl  := label.new(bar_index + 15, aEdge, "alt " + (a.btm > close ? "▲ " : "▼ ") + f_kindName(a.kind) + " · " + str.tostring(a.score, "#"),
+             style = label.style_label_left, color = CLEAR, textcolor = color.new(cText, 30), size = size.tiny, text_font_family = font.family_monospace)
+
+    // ── equilibrium of the dealing range
+    if iShowEQ and not na(eqLvl)
+        eqLine := line.new(math.min(swHBar, swLBar), eqLvl, bar_index + 5, eqLvl, color = color.new(cNeut, 20), style = line.style_dotted)
+        eqLbl  := label.new(bar_index + 5, eqLvl, "EQ · " + (close > eqLvl ? "premium" : "discount"), style = label.style_label_left,
+             color = CLEAR, textcolor = color.new(cNeut, 0), size = size.tiny, text_font_family = font.family_monospace)
+
+    // ── dashboard
+    if iShowTbl
+        table.clear(dash, 0, 0, 1, 14)
+        table.cell(dash, 0, 0, "◆ DOL ENGINE", text_color = cDol, text_halign = text.align_left, text_size = tblSize, text_font_family = font.family_monospace)
+        table.cell(dash, 1, 0, iMode, text_color = cText, text_halign = text.align_right, text_size = tblSize, text_font_family = font.family_monospace)
+        f_cell(1, "HTF " + f_tfName(tfH), f_biasTxt(biasH), f_biasCol(biasH))
+        f_cell(2, "MTF " + f_tfName(tfM), f_biasTxt(biasM), f_biasCol(biasM))
+        f_cell(3, "LTF " + f_tfName(tfL), f_biasTxt(biasL), f_biasCol(biasL))
+        f_cell(4, "Structure", f_biasTxt(trend), f_biasCol(trend))
+        if bestI >= 0
+            Liq   p    = pool.get(bestI)
+            float edge = bestDir == 1 ? p.btm : p.top
+            f_cell(5, "Active DOL", (bestDir == 1 ? "▲ " : "▼ ") + f_kindName(p.kind), cDol)
+            f_cell(6, "Level", str.tostring(edge, format.mintick), cText)
+            f_cell(7, "Score", f_scoreBar(p.score) + " " + str.tostring(p.score, "#"), cDol)
+            f_cell(8, "PoT", str.tostring(p.pot, "#.0") + "%", p.pot >= 60 ? cBull : p.pot >= 35 ? cDol : cBear)
+            f_cell(9, "Distance", str.tostring(math.abs(edge - close) / atrN, "#.##") + " ATR", cText)
+        else
+            f_cell(5, "Active DOL", "— none in range", cNeut)
+        f_cell(10, "Order Flow", "Buy " + str.tostring(flowPct, "#") + "% · RVOL " + str.tostring(rvol, "#.0"),
+             flowDir == 1 ? cBull : flowDir == -1 ? cBear : cNeut)
+        if not na(swH) and not na(swL) and swH > swL
+            float posPct = 100.0 * (close - swL) / (swH - swL)
+            f_cell(11, "Range", (posPct >= 50 ? "Premium " : "Discount ") + str.tostring(posPct, "#") + "%", posPct >= 50 ? cBear : cBull)
+        if iShowAlt and altI >= 0
+            Liq a = pool.get(altI)
+            f_cell(12, "Alt Target", (a.btm > close ? "▲ " : "▼ ") + f_kindName(a.kind) + " · " + str.tostring(a.score, "#"), color.new(cText, 20))
+        if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(tfL)
+            f_cell(13, "⚠ Chart TF", "use ≤ " + f_tfName(tfL), cDol)
+
+// ───────────────────────────────────────────── ORDER-FLOW IMBALANCE BARS ────
+imbUp = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol >= 0.5
+imbDn = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol <= -0.5
+plotshape(imbUp, "Buy Imbalance", shape.triangleup, location.belowbar, color.new(cBull, 25), size = size.tiny)
+plotshape(imbDn, "Sell Imbalance", shape.triangledown, location.abovebar, color.new(cBear, 25), size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────── ALERTS ─────
+alertcondition(evNew,   "New DOL Target Active", "DOL Engine · new DOL target on {{ticker}} ({{interval}})")
+alertcondition(evSwept, "DOL Target Swept",      "DOL Engine · DOL target swept on {{ticker}} ({{interval}})")
+alertcondition(evIFVG,  "New iFVG Formed",       "DOL Engine · new inversion FVG on {{ticker}} ({{interval}})")
+alertcondition(evMS,    "BOS / CHoCH",           "DOL Engine · market structure break on {{ticker}} ({{interval}})")
+
+if evNew and bestI >= 0
+    Liq p = pool.get(bestI)
+    alert("DOL Engine · New target " + (bestDir == 1 ? "▲ " : "▼ ") + f_kindName(p.kind) + " @ " +
+         str.tostring(bestDir == 1 ? p.btm : p.top, format.mintick) + " · score " + str.tostring(p.score, "#") +
+         " · PoT " + str.tostring(p.pot, "#.0") + "%", alert.freq_once_per_bar_close)
+if evSwept
+    alert("DOL Engine · DOL target swept on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if evIFVG
+    alert("DOL Engine · new iFVG on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if evMS
+    alert("DOL Engine · " + msTag + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
