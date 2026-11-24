@@ -52,7 +52,7 @@ iOffset     = input.int(30, "Right Offset (bars)", minval = 5, maxval = 200, gro
 
 grpX = "🎯 Entry Signals (at DOL)"
 iShowSig  = input.bool(true, "Show BUY / SELL at DOL", group = grpX,
-     tooltip = "DOL above reached → SELL (buy-side liquidity taken). DOL below reached → BUY (sell-side liquidity taken). Fires when a candle closes back through the swept level.")
+     tooltip = "After a DOL is swept, BUY only if the new active DOL is ABOVE, SELL only if it is BELOW. TP = active DOL. The signal disappears when the DOL is touched, SL is hit or the DOL flips against it.")
 iSigMode  = input.string("Rejection + MSS", "Confirmation", options = ["Rejection", "Rejection + Displacement", "Rejection + MSS"], group = grpX,
      tooltip = "Rejection: close back through the DOL level. Displacement: also a strong body (≥ 0.5 × chart ATR). MSS: also a close beyond the last 1m swing (market structure shift) — safest.")
 iMssLen   = input.int(2, "MSS Swing Length (1m)", minval = 1, maxval = 10, group = grpX)
@@ -61,7 +61,6 @@ iMinRR    = input.float(1.5, "Min RR to Signal", minval = 0.0, step = 0.25, grou
 iSlBuf    = input.float(0.10, "SL Buffer (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpX)
 iRR       = input.float(2.0, "Fallback TP (R multiple)", minval = 0.5, step = 0.5, group = grpX)
 iSigLines = input.bool(true, "Show Entry / SL / TP", group = grpX)
-iMaxSig   = input.int(15, "Max Signals Kept", minval = 1, maxval = 50, group = grpX)
 
 grpSF = "🛡 Safety Filters (no extra drawings)"
 iUseKZ   = input.bool(true, "Signals only inside Killzones", group = grpSF)
@@ -650,26 +649,88 @@ if barstate.isconfirmed and doScore
         primKey := ""
 
 // ─────────────────────────────────────────── ENTRY SIGNALS AT THE DOL ───────
-// Sweep of an up-DOL arms a SELL, sweep of a down-DOL arms a BUY. The signal
-// fires when a candle closes back through the swept level (rejection).
-var int   armDir = 0
-var float armLvl = na
-var float armExt = na
-var int   armBar = na
+// Self-consistent logic:
+//   1. A DOL is reached (liquidity swept) → setup is armed in the opposite way.
+//   2. The signal only fires if the NEW active DOL points the same way as the
+//      trade (BUY → DOL above, SELL → DOL below) and all safety gates pass.
+//   3. TP = the active DOL. It follows the DOL while it keeps the direction.
+//   4. The signal and its lines disappear when the DOL (TP) is touched, the SL
+//      is hit, or the active DOL flips against the trade.
+var int    armDir  = 0
+var float  armLvl  = na
+var float  armExt  = na
+var int    armBar  = na
 var string armName = ""
-var float armMss = na
-var bool  armPD  = true
-var bool  armSmt = false
-var array<label> sigLbls  = array.new<label>()
-var array<line>  sigLines = array.new<line>()
-bool evBuy  = false
-bool evSell = false
+var float  armMss  = na
+var bool   armPD   = true
+var bool   armSmt  = false
+
+var int    tDir   = 0
+var float  tEntry = na
+var float  tSL    = na
+var float  tTP    = na
+var int    tBar   = na
+var label  tLbl   = na
+var line   tLe    = na
+var line   tLs    = na
+var line   tLt    = na
+var label  tLsL   = na
+var label  tLtL   = na
+
+bool  evBuy   = false
+bool  evSell  = false
+bool  evTP    = false
+bool  evSL    = false
+bool  evInval = false
 float sigEntry = na
 float sigSL    = na
 float sigTP    = na
 atrChart = nz(ta.atr(14), high - low)
 
+int   activeDir = 0
+float activeLvl = na
+if primI >= 0
+    activeDir := cs.get(primI).dir
+    activeLvl := f_edge(cs.get(primI))
+
+f_clearTrade() =>
+    label.delete(tLbl)
+    line.delete(tLe)
+    line.delete(tLs)
+    line.delete(tLt)
+    label.delete(tLsL)
+    label.delete(tLtL)
+    true
+
 if iShowSig and barstate.isconfirmed and doScore
+    // ── manage the open signal
+    if tDir != 0
+        bool hitTP = tDir == 1 ? high >= tTP : low <= tTP
+        bool hitSL = tDir == 1 ? low <= tSL : high >= tSL
+        bool flip  = activeDir != 0 and activeDir != tDir
+        if hitTP or hitSL or flip
+            evTP    := hitTP
+            evSL    := hitSL and not hitTP
+            evInval := flip and not hitTP and not hitSL
+            f_clearTrade()
+            tDir := 0
+        else
+            // TP follows the active DOL while it keeps the trade direction
+            if activeDir == tDir and not na(activeLvl) and activeLvl != tTP
+                tTP := activeLvl
+                if not na(tLt)
+                    tLt.set_y1(tTP)
+                    tLt.set_y2(tTP)
+                    tLtL.set_y(tTP)
+                    tLtL.set_text("TP · DOL " + str.tostring(tTP, format.mintick))
+            if not na(tLe)
+                tLe.set_x2(bar_index + 10)
+                tLs.set_x2(bar_index + 10)
+                tLt.set_x2(bar_index + 10)
+                tLsL.set_x(bar_index + 10)
+                tLtL.set_x(bar_index + 10)
+
+    // ── arm after a DOL sweep
     if evSwept
         armDir  := sweptDir == 1 ? -1 : 1
         armLvl  := sweptLvl
@@ -677,12 +738,14 @@ if iShowSig and barstate.isconfirmed and doScore
         armBar  := bar_index
         armName := sweptName
         armMss  := armDir == -1 ? microL : microH
-        float rngHi = math.max(nz(pdh, runHiD), runHiD)
-        float rngLo = math.min(nz(pdl, runLoD), runLoD)
+        float rngHi  = math.max(nz(pdh, runHiD), runHiD)
+        float rngLo  = math.min(nz(pdl, runLoD), runLoD)
         float rngMid = (rngHi + rngLo) / 2.0
         armPD   := armDir == -1 ? high > rngMid : low < rngMid
         armSmt  := false
-    if armDir != 0
+
+    // ── fire
+    if armDir != 0 and tDir == 0
         armExt := armDir == -1 ? math.max(armExt, high) : math.min(armExt, low)
         armSmt := armSmt or (armDir == -1 ? smtBear : smtBull)
         bool dispOk = math.abs(close - open) >= 0.5 * atrChart
@@ -692,61 +755,38 @@ if iShowSig and barstate.isconfirmed and doScore
         bool newsOk = not iUseNews or not inNews
         bool pdOk   = not iUsePD or armPD
         bool smtOk  = not smtOn or iSmtMode != "Required" or armSmt
-        bool gates  = modeOk and kzOk and newsOk and pdOk and smtOk
-        bool sell = armDir == -1 and close < armLvl and close < open and gates
-        bool buy  = armDir == 1 and close > armLvl and close > open and gates
-        // RR check before firing
-        float preSL = armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
-        float preRisk = math.abs(close - preSL)
-        float preTP = na
-        float preBest = 1e10
-        if (sell or buy) and nC > 0
-            for i = 0 to nC - 1
-                Cand c = cs.get(i)
-                float e = f_edge(c)
-                if c.dir == armDir and math.abs(e - close) > 0.5 * preRisk and math.abs(e - close) < preBest
-                    preBest := math.abs(e - close)
-                    preTP   := e
-        if na(preTP)
-            preTP := close + armDir * iRR * preRisk
-        bool rrOk = preRisk > 0 and math.abs(preTP - close) / preRisk >= iMinRR
-        sell := sell and rrOk
-        buy  := buy and rrOk
-        if sell or buy
-            sigEntry := close
-            sigSL    := armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
-            float risk = math.abs(sigEntry - sigSL)
-            // TP = nearest liquidity on the opposite side, else R multiple
-            float best = 1e10
-            if nC > 0
-                for i = 0 to nC - 1
-                    Cand c = cs.get(i)
-                    float e = f_edge(c)
-                    if c.dir == armDir and math.abs(e - close) > 0.5 * risk and math.abs(e - close) < best
-                        best  := math.abs(e - close)
-                        sigTP := e
-            if na(sigTP)
-                sigTP := sigEntry + armDir * iRR * risk
-            float rr = risk > 0 ? math.abs(sigTP - sigEntry) / risk : 0.0
+        bool dolOk  = activeDir == armDir                       // active DOL agrees with the trade
+        bool candle = armDir == -1 ? close < armLvl and close < open : close > armLvl and close > open
+        float slP   = armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
+        float risk  = math.abs(close - slP)
+        float rr    = risk > 0 and not na(activeLvl) ? math.abs(activeLvl - close) / risk : 0.0
+        bool rrOk   = rr >= iMinRR
+        if candle and modeOk and kzOk and newsOk and pdOk and smtOk and dolOk and rrOk
+            bool sell = armDir == -1
+            tDir   := armDir
+            tEntry := close
+            tSL    := slP
+            tTP    := activeLvl
+            tBar   := bar_index
+            sigEntry := tEntry
+            sigSL    := tSL
+            sigTP    := tTP
             evSell := sell
-            evBuy  := buy
+            evBuy  := not sell
             int safety = (inKZ ? 1 : 0) + (mssOk ? 1 : 0) + (dispOk ? 1 : 0) + (armPD ? 1 : 0) + (armSmt ? 1 : 0)
-            string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " · RR " + str.tostring(rr, "#.0") + " · ★" + str.tostring(safety) + "/5"
-            sigLbls.push(label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
-                 color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace))
+            string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " → " + cs.get(primI).name + " · RR " + str.tostring(rr, "#.0") +
+                 " · ★" + str.tostring(safety) + "/5"
+            tLbl := label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
+                 color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace)
             if iSigLines
-                int x2 = bar_index + 20
-                sigLines.push(line.new(bar_index, sigEntry, x2, sigEntry, color = cAcc, width = 2))
-                sigLines.push(line.new(bar_index, sigSL, x2, sigSL, color = color.new(cBear, 10), style = line.style_dashed, width = 1))
-                sigLines.push(line.new(bar_index, sigTP, x2, sigTP, color = color.new(cAcc, 20), style = line.style_dashed, width = 1))
-                sigLbls.push(label.new(x2, sigSL, "SL " + str.tostring(sigSL, format.mintick), style = label.style_label_left, color = CLEAR,
-                     textcolor = color.new(cBear, 10), size = size.tiny, text_font_family = font.family_monospace))
-                sigLbls.push(label.new(x2, sigTP, "TP " + str.tostring(sigTP, format.mintick), style = label.style_label_left, color = CLEAR,
-                     textcolor = cAcc, size = size.tiny, text_font_family = font.family_monospace))
-            while sigLbls.size() > iMaxSig * 3
-                sigLbls.shift().delete()
-            while sigLines.size() > iMaxSig * 3
-                sigLines.shift().delete()
+                int x2 = bar_index + 10
+                tLe  := line.new(bar_index, tEntry, x2, tEntry, color = cAcc, width = 2)
+                tLs  := line.new(bar_index, tSL, x2, tSL, color = color.new(cBear, 10), style = line.style_dashed, width = 1)
+                tLt  := line.new(bar_index, tTP, x2, tTP, color = color.new(cAcc, 20), style = line.style_dashed, width = 1)
+                tLsL := label.new(x2, tSL, "SL " + str.tostring(tSL, format.mintick), style = label.style_label_left, color = CLEAR,
+                     textcolor = color.new(cBear, 10), size = size.tiny, text_font_family = font.family_monospace)
+                tLtL := label.new(x2, tTP, "TP · DOL " + str.tostring(tTP, format.mintick), style = label.style_label_left, color = CLEAR,
+                     textcolor = cAcc, size = size.tiny, text_font_family = font.family_monospace)
             armDir := 0
         else if bar_index - armBar >= iSigBars or (armDir == -1 and close > armExt) or (armDir == 1 and close < armExt)
             armDir := 0
@@ -944,6 +984,9 @@ alertcondition(evNew,   "DOL ≥ threshold active", "DOL Engine Pro · new high-
 alertcondition(evSwept, "DOL target reached",     "DOL Engine Pro · DOL target reached on {{ticker}}")
 alertcondition(evBuy,   "BUY at DOL",             "DOL Engine Pro · BUY after sell-side DOL sweep on {{ticker}}")
 alertcondition(evSell,  "SELL at DOL",            "DOL Engine Pro · SELL after buy-side DOL sweep on {{ticker}}")
+alertcondition(evTP,    "Signal TP (DOL reached)", "DOL Engine Pro · signal reached its DOL target on {{ticker}}")
+alertcondition(evSL,    "Signal SL hit",          "DOL Engine Pro · signal stopped out on {{ticker}}")
+alertcondition(evInval, "Signal invalidated",     "DOL Engine Pro · DOL flipped against the open signal on {{ticker}}")
 alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure break on {{ticker}}")
 
 if evNew and primI >= 0
