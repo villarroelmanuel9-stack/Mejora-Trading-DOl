@@ -14,7 +14,7 @@
 //  Educational tool — not financial advice.
 // ════════════════════════════════════════════════════════════════════════════
 indicator("DOL Engine · Liquidity Compass", shorttitle = "DOL Engine", overlay = true,
-     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
 
 // ─────────────────────────────────────────────────────────────── KINDS ──────
 // even = bullish / buy-side, odd = bearish / sell-side
@@ -36,7 +36,11 @@ grpG = "⚙ General"
 iMode      = input.string("Day Trading", "Trading Mode", options = ["Swing", "Day Trading", "Scalping"], group = grpG,
      tooltip = "Swing: D / 4H / 1H · Day Trading: 4H / 1H / 15m · Scalping: 1H / 15m / 5m")
 iSwingLen  = input.int(5, "Swing Length (pivots)", minval = 2, maxval = 50, group = grpG)
-iMaxPool   = input.int(40, "Max Candidates in Pool", minval = 10, maxval = 80, group = grpG)
+iMaxPool   = input.int(30, "Max Candidates in Pool", minval = 10, maxval = 80, group = grpG)
+iCalcBars  = input.int(1500, "Calculated Bars (history)", minval = 300, maxval = 10000, group = grpG,
+     tooltip = "Only the last N bars are processed. Lower = faster (avoids the 'script takes too long' error).")
+iScoreBars = input.int(300, "Scored Bars (DOL history)", minval = 50, maxval = 5000, group = grpG,
+     tooltip = "DOL scoring / ghost trail only runs on the last N bars.")
 iMaxAge    = input.int(600, "Max Zone Age (bars)", minval = 50, group = grpG)
 
 grpS = "🎯 DOL Scoring"
@@ -289,8 +293,13 @@ bool   evIFVG  = false
 bool   evMS    = false
 string msTag   = ""
 
+// Performance windows: heavy logic only on recent history
+inCalc  = last_bar_index - bar_index <= iCalcBars
+inScore = last_bar_index - bar_index <= iScoreBars
+doCalc  = barstate.isconfirmed and inCalc
+
 // ───────────────────────────────────────────────── 1 · LIFECYCLE (closed bar)
-if barstate.isconfirmed and pool.size() > 0
+if doCalc and pool.size() > 0
     for i = pool.size() - 1 to 0
         Liq  z       = pool.get(i)
         int  k       = z.kind
@@ -328,6 +337,7 @@ if barstate.isconfirmed and pool.size() > 0
             else if low < z.top
                 z.top := low                      // partial fill
                 z.markTouched()
+                z.extend(bar_index)
         else if k == K_FVGS
             if close > z.top
                 z.kind := K_IFVGB
@@ -338,6 +348,7 @@ if barstate.isconfirmed and pool.size() > 0
             else if high > z.btm
                 z.btm := high
                 z.markTouched()
+                z.extend(bar_index)
         else if k == K_OBB
             if close < z.btm
                 z.kind := K_BRKS
@@ -375,11 +386,9 @@ if barstate.isconfirmed and pool.size() > 0
                     sweptLines.shift().delete()
             z.kill()
             pool.remove(i)
-        else
-            z.extend(bar_index)
 
 // ─────────────────────────────────────── 2 · STRUCTURE & NEW CANDIDATES ─────
-if barstate.isconfirmed
+if doCalc
     // ── swing highs → BSL / EQH
     if not na(ph)
         swH     := ph
@@ -444,7 +453,7 @@ if barstate.isconfirmed
                 msLines.shift().delete()
                 msLbls.shift().delete()
         // Bullish OB = candle with the lowest low of the leg that broke structure
-        int n = math.min(bar_index - swHBar, 100)
+        int n = math.min(bar_index - swHBar, 50)
         if n >= 1
             float mn  = low[1]
             int   idx = 1
@@ -467,7 +476,7 @@ if barstate.isconfirmed
             if msLines.size() > 40
                 msLines.shift().delete()
                 msLbls.shift().delete()
-        int n = math.min(bar_index - swLBar, 100)
+        int n = math.min(bar_index - swLBar, 50)
         if n >= 1
             float mx  = high[1]
             int   idx = 1
@@ -505,7 +514,7 @@ float altSc  = -1.0
 int   altI   = -1
 int   bestDir = 0
 
-if pool.size() > 0
+if inScore and pool.size() > 0
     for i = 0 to pool.size() - 1
         Liq z = pool.get(i)
         z.score := 0.0
@@ -547,7 +556,7 @@ int bestUid = -1
 if bestI >= 0
     bestUid := pool.get(bestI).uid
 
-if barstate.isconfirmed
+if barstate.isconfirmed and inScore
     if bestUid != -1 and bestUid != primUid
         evNew := true
     primUid := bestUid
