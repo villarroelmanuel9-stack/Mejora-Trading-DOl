@@ -10,6 +10,7 @@ Diseñado para usarse en el **gráfico de 1 minuto**. Los objetivos de liquidez 
 - Si ningún objetivo llega al 80%, el HUD muestra `◇ WAITING ≥ 80%` junto con el mejor candidato del momento.
 - **Niveles de liquidez**: PDH/PDL, PWH/PWL, ASIA-H/L, LON-H/L, NY-H/L, BSL/SSL y EQH/EQL de 1H y 15m.
 - **Zonas FVG** de 1H y 15m (BFVG alcista, SFVG bajista), con relleno parcial, y el **+ ANCHOR FVG** en el lado opuesto al objetivo.
+- **Señales BUY / SELL en el DOL** (ámbar): cuando el precio alcanza un DOL **arriba** se prepara una **SELL** (barrida de liquidez compradora); si el DOL está **abajo**, una **BUY**. La señal sale cuando una vela cierra de vuelta al otro lado del nivel (rechazo), dentro de las 15 velas siguientes, y queda opcionalmente filtrada por desplazamiento. Marca la entrada, el **SL** (extremo de la barrida más un margen) y el **TP** (siguiente liquidez del lado contrario o 2R), con el RR en la etiqueta. Tiene alertas *BUY at DOL* y *SELL at DOL*.
 - Opcional: BOS / MSS en el gráfico y barras de desequilibrio de order flow.
 
 ### Confirmación (0–100)

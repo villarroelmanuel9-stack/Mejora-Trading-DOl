@@ -50,6 +50,17 @@ iMsLen      = input.int(5, "BOS / MSS Swing Length", minval = 2, maxval = 30, gr
 iGhosts     = input.int(5, "Ghost Trail (reached DOLs)", minval = 0, maxval = 30, group = grpD)
 iOffset     = input.int(30, "Right Offset (bars)", minval = 5, maxval = 200, group = grpD)
 
+grpX = "🎯 Entry Signals (at DOL)"
+iShowSig  = input.bool(true, "Show BUY / SELL at DOL", group = grpX,
+     tooltip = "DOL above reached → SELL (buy-side liquidity taken). DOL below reached → BUY (sell-side liquidity taken). Fires when a candle closes back through the swept level.")
+iSigMode  = input.string("Rejection", "Confirmation", options = ["Rejection", "Rejection + Displacement"], group = grpX,
+     tooltip = "Rejection: close back through the DOL level. Displacement: also requires a strong body (≥ 0.5 × chart ATR).")
+iSigBars  = input.int(15, "Bars to Confirm After Sweep", minval = 1, maxval = 100, group = grpX)
+iSlBuf    = input.float(0.10, "SL Buffer (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpX)
+iRR       = input.float(2.0, "Fallback TP (R multiple)", minval = 0.5, step = 0.5, group = grpX)
+iSigLines = input.bool(true, "Show Entry / SL / TP", group = grpX)
+iMaxSig   = input.int(15, "Max Signals Kept", minval = 1, maxval = 50, group = grpX)
+
 grpH = "📊 HUD"
 iShowHud = input.bool(true, "Show HUD", group = grpH)
 iHudPos  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpH)
@@ -556,12 +567,18 @@ var string primName = ""
 var array<line>  ghostL  = array.new<line>()
 var array<label> ghostLb = array.new<label>()
 
-bool evNew   = false
-bool evSwept = false
+bool   evNew     = false
+bool   evSwept   = false
+float  sweptLvl  = na
+int    sweptDir  = 0
+string sweptName = ""
 
 if barstate.isconfirmed and doScore
     if primKey != "" and ((primDir == 1 and high >= primLvl) or (primDir == -1 and low <= primLvl))
-        evSwept := true
+        evSwept   := true
+        sweptLvl  := primLvl
+        sweptDir  := primDir
+        sweptName := primName
         if iGhosts > 0
             ghostL.push(line.new(primT, primLvl, time, primLvl, xloc = xloc.bar_time, color = color.new(cAcc, 45), style = line.style_dotted, width = 2))
             ghostLb.push(label.new(time, primLvl, "✓ " + primName, xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR,
@@ -582,6 +599,73 @@ if barstate.isconfirmed and doScore
         primName := p.name + " " + p.tf
     else
         primKey := ""
+
+// ─────────────────────────────────────────── ENTRY SIGNALS AT THE DOL ───────
+// Sweep of an up-DOL arms a SELL, sweep of a down-DOL arms a BUY. The signal
+// fires when a candle closes back through the swept level (rejection).
+var int   armDir = 0
+var float armLvl = na
+var float armExt = na
+var int   armBar = na
+var string armName = ""
+var array<label> sigLbls  = array.new<label>()
+var array<line>  sigLines = array.new<line>()
+bool evBuy  = false
+bool evSell = false
+float sigEntry = na
+float sigSL    = na
+float sigTP    = na
+atrChart = nz(ta.atr(14), high - low)
+
+if iShowSig and barstate.isconfirmed and doScore
+    if evSwept
+        armDir  := sweptDir == 1 ? -1 : 1
+        armLvl  := sweptLvl
+        armExt  := sweptDir == 1 ? high : low
+        armBar  := bar_index
+        armName := sweptName
+    if armDir != 0
+        armExt := armDir == -1 ? math.max(armExt, high) : math.min(armExt, low)
+        bool disp = iSigMode == "Rejection" or math.abs(close - open) >= 0.5 * atrChart
+        bool sell = armDir == -1 and close < armLvl and close < open and disp
+        bool buy  = armDir == 1 and close > armLvl and close > open and disp
+        if sell or buy
+            sigEntry := close
+            sigSL    := armDir == -1 ? armExt + iSlBuf * atrRef : armExt - iSlBuf * atrRef
+            float risk = math.abs(sigEntry - sigSL)
+            // TP = nearest liquidity on the opposite side, else R multiple
+            float best = 1e10
+            if nC > 0
+                for i = 0 to nC - 1
+                    Cand c = cs.get(i)
+                    float e = f_edge(c)
+                    if c.dir == armDir and math.abs(e - close) > 0.5 * risk and math.abs(e - close) < best
+                        best  := math.abs(e - close)
+                        sigTP := e
+            if na(sigTP)
+                sigTP := sigEntry + armDir * iRR * risk
+            float rr = risk > 0 ? math.abs(sigTP - sigEntry) / risk : 0.0
+            evSell := sell
+            evBuy  := buy
+            string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " · RR " + str.tostring(rr, "#.0")
+            sigLbls.push(label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
+                 color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace))
+            if iSigLines
+                int x2 = bar_index + 20
+                sigLines.push(line.new(bar_index, sigEntry, x2, sigEntry, color = cAcc, width = 2))
+                sigLines.push(line.new(bar_index, sigSL, x2, sigSL, color = color.new(cBear, 10), style = line.style_dashed, width = 1))
+                sigLines.push(line.new(bar_index, sigTP, x2, sigTP, color = color.new(cAcc, 20), style = line.style_dashed, width = 1))
+                sigLbls.push(label.new(x2, sigSL, "SL " + str.tostring(sigSL, format.mintick), style = label.style_label_left, color = CLEAR,
+                     textcolor = color.new(cBear, 10), size = size.tiny, text_font_family = font.family_monospace))
+                sigLbls.push(label.new(x2, sigTP, "TP " + str.tostring(sigTP, format.mintick), style = label.style_label_left, color = CLEAR,
+                     textcolor = cAcc, size = size.tiny, text_font_family = font.family_monospace))
+            while sigLbls.size() > iMaxSig * 3
+                sigLbls.shift().delete()
+            while sigLines.size() > iMaxSig * 3
+                sigLines.shift().delete()
+            armDir := 0
+        else if bar_index - armBar >= iSigBars or (armDir == -1 and close > armExt) or (armDir == 1 and close < armExt)
+            armDir := 0
 
 // ───────────────────────────────────────────── CHART-TF STRUCTURE (opt.) ────
 var float msH = na
@@ -774,11 +858,16 @@ plotshape(imbDn, "Sell Imbalance", shape.triangledown, location.abovebar, color.
 // ─────────────────────────────────────────────────────────────── ALERTS ─────
 alertcondition(evNew,   "DOL ≥ threshold active", "DOL Engine Pro · new high-confirmation DOL on {{ticker}}")
 alertcondition(evSwept, "DOL target reached",     "DOL Engine Pro · DOL target reached on {{ticker}}")
+alertcondition(evBuy,   "BUY at DOL",             "DOL Engine Pro · BUY after sell-side DOL sweep on {{ticker}}")
+alertcondition(evSell,  "SELL at DOL",            "DOL Engine Pro · SELL after buy-side DOL sweep on {{ticker}}")
 alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure break on {{ticker}}")
 
 if evNew and primI >= 0
     Cand p = cs.get(primI)
     alert("DOL Engine Pro · " + (p.dir == 1 ? "▲ " : "▼ ") + p.name + " " + p.tf + " @ " + str.tostring(f_edge(p), format.mintick) +
          " · Confirmation " + str.tostring(p.conv, "#") + "% · PoT " + str.tostring(p.pot, "#.0") + "%", alert.freq_once_per_bar_close)
+if evBuy or evSell
+    alert("DOL Engine Pro · " + (evSell ? "SELL" : "BUY") + " " + syminfo.ticker + " @ " + str.tostring(sigEntry, format.mintick) +
+         " · SL " + str.tostring(sigSL, format.mintick) + " · TP " + str.tostring(sigTP, format.mintick), alert.freq_once_per_bar_close)
 if evSwept
-    alert("DOL Engine Pro · target reached: " + primName + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
+    alert("DOL Engine Pro · target reached: " + sweptName + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
