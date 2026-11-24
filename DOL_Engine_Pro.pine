@@ -84,7 +84,7 @@ iConsPoT = input.bool(true, "Conservative PoT", group = grpSF,
      tooltip = "Ignores favourable drift, trims volatility 15 % and reduces it outside killzones → PoT is harder to inflate.")
 
 grpL = "🧠 Self-Learning (calibrates on your chart)"
-iLearnBars   = input.int(4000, "Learning Window (bars)", minval = 300, maxval = 20000, group = grpL,
+iLearnBars   = input.int(2000, "Learning Window (bars)", minval = 300, maxval = 20000, group = grpL,
      tooltip = "History used to measure how often DOLs are reached and how signals perform. Lower it if the script is slow.")
 iSampleEvery = input.int(10, "DOL Sample Every (bars)", minval = 1, maxval = 120, group = grpL)
 iPrior       = input.int(10, "Calibration Prior Strength", minval = 1, maxval = 100, group = grpL,
@@ -557,7 +557,13 @@ f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int t
 f_fvgDepth(float top, float btm, float a) =>
     math.min(18.0, 8.0 + 10.0 * (top - btm) / math.max(nz(a, atrRef), syminfo.mintick))
 
-doScore = last_bar_index - bar_index <= iLearnBars
+// Performance: full scoring only on the most recent bars; in older history
+// score only on sample bars and while a setup / trade is in progress.
+var int armDir = 0
+var int tDir   = 0
+inLearn  = last_bar_index - bar_index <= iLearnBars
+inRecent = last_bar_index - bar_index <= 200
+doScore  = inLearn and (inRecent or bar_index % iSampleEvery == 0 or armDir != 0 or (tDir != 0 and bar_index % 3 == 0))
 tfAName = f_tfName(iTfA)
 tfBName = f_tfName(iTfB)
 
@@ -638,6 +644,17 @@ f_kRate(int b) =>
 // ─────────────────────────────────────────────────────────────── SCORING ────
 int nC = cs.size()
 array<float> convs = array.new<float>()
+// FVG zone edges (path blockers), collected once per bar
+array<float> zUp = array.new<float>()
+array<float> zDn = array.new<float>()
+if nC > 0
+    for i = 0 to nC - 1
+        Cand z = cs.get(i)
+        if z.zone
+            if z.dir == 1
+                zUp.push(z.btm)
+            else
+                zDn.push(z.top)
 if nC > 0
     for i = 0 to nC - 1
         Cand  c    = cs.get(i)
@@ -651,13 +668,12 @@ if nC > 0
             float sFlow  = 15.0 * math.max(0.0, math.min(1.0, 0.5 + (flowPct - 50.0) * c.dir / 20.0))
             float sProx  = 20.0 * (1.0 - d / iMaxATR)
             int   nBlock = 0
-            for j = 0 to nC - 1
-                if j != i
-                    Cand o = cs.get(j)
-                    if o.zone and o.dir == c.dir
-                        float oe = f_edge(o)
-                        if (c.dir == 1 and oe < edge) or (c.dir == -1 and oe > edge)
-                            nBlock += 1
+            array<float> zs = c.dir == 1 ? zUp : zDn
+            if zs.size() > 0
+                for j = 0 to zs.size() - 1
+                    float oe = zs.get(j)
+                    if (c.dir == 1 and oe < edge) or (c.dir == -1 and oe > edge)
+                        nBlock += 1
             float sClear = math.max(0.0, 15.0 - 5.0 * nBlock)
             c.conv := math.min(100.0, sDepth + sAlign + sFlow + sProx + sClear)
             c.pot  := f_pot(math.abs(edge - close), c.dir)
@@ -701,7 +717,7 @@ var array<int>   smD = array.new<int>()
 var array<int>   smB = array.new<int>()
 var array<int>   smP = array.new<int>()
 var array<int>   smK = array.new<int>()
-if barstate.isconfirmed and doScore
+if barstate.isconfirmed and inLearn
     if smL.size() > 0
         for i = smL.size() - 1 to 0
             bool hit = smD.get(i) == 1 ? high >= smL.get(i) : low <= smL.get(i)
@@ -718,7 +734,7 @@ if barstate.isconfirmed and doScore
                 smB.remove(i)
                 smP.remove(i)
                 smK.remove(i)
-    if bar_index % iSampleEvery == 0 and bestI >= 0
+    if doScore and bar_index % iSampleEvery == 0 and bestI >= 0
         Cand sc = cs.get(bestI)
         if sc.conv > 0
             smL.push(f_edge(sc))
@@ -742,7 +758,7 @@ float  sweptLvl  = na
 int    sweptDir  = 0
 string sweptName = ""
 
-if barstate.isconfirmed and doScore
+if barstate.isconfirmed and inLearn
     if primKey != "" and ((primDir == 1 and high >= primLvl) or (primDir == -1 and low <= primLvl))
         evSwept   := true
         sweptLvl  := primLvl
@@ -756,7 +772,7 @@ if barstate.isconfirmed and doScore
                 ghostL.shift().delete()
                 ghostLb.shift().delete()
         primKey := ""
-    if primI >= 0
+    if doScore and primI >= 0
         Cand   p = cs.get(primI)
         string k = p.name + p.tf + str.tostring(f_edge(p))
         if k != primKey
@@ -766,7 +782,7 @@ if barstate.isconfirmed and doScore
         primDir  := p.dir
         primT    := p.t
         primName := p.name + " " + p.tf
-    else
+    else if doScore
         primKey := ""
 
 // ─────────────────────────────────────────── ENTRY SIGNALS AT THE DOL ───────
@@ -777,7 +793,6 @@ if barstate.isconfirmed and doScore
 //   3. TP = the active DOL. It follows the DOL while it keeps the direction.
 //   4. The signal and its lines disappear when the DOL (TP) is touched, the SL
 //      is hit, or the active DOL flips against the trade.
-var int    armDir  = 0
 var float  armLvl  = na
 var float  armExt  = na
 var int    armBar  = na
@@ -786,7 +801,6 @@ var float  armMss  = na
 var bool   armPD   = true
 var bool   armSmt  = false
 
-var int    tDir   = 0
 var float  tEntry = na
 var float  tSL    = na
 var float  tTP    = na
@@ -826,12 +840,12 @@ f_clearTrade() =>
     label.delete(tLtL)
     true
 
-if iShowSig and barstate.isconfirmed and doScore
+if iShowSig and barstate.isconfirmed and inLearn
     // ── manage the open signal
     if tDir != 0
         bool hitTP = tDir == 1 ? high >= tTP : low <= tTP
         bool hitSL = tDir == 1 ? low <= tSL : high >= tSL
-        bool flip  = activeDir != 0 and activeDir != tDir
+        bool flip  = doScore and activeDir != 0 and activeDir != tDir
         if hitTP or hitSL or flip
             // record outcome in R (SL and TP in the same bar counts as a loss)
             float rRes = hitSL ? -1.0 : hitTP ? (tTP - tEntry) * tDir / tRisk : (close - tEntry) * tDir / tRisk
@@ -949,7 +963,7 @@ var array<label> msLbls  = array.new<label>()
 mph = ta.pivothigh(high, iMsLen, iMsLen)
 mpl = ta.pivotlow(low, iMsLen, iMsLen)
 bool evMS = false
-if iShowMS and barstate.isconfirmed and last_bar_index - bar_index <= 1500
+if iShowMS and barstate.isconfirmed and inLearn
     if not na(mph)
         msH := mph
         msHt := time[iMsLen]
