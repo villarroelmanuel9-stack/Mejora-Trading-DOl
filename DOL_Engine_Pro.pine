@@ -42,6 +42,8 @@ iHold      = input.int(10, "Hold Tolerance (points)", minval = 0, maxval = 30, g
      tooltip = "The active DOL stays active while its Confirmation / Probability are within this many points of the gate (stops flickering).")
 iSwitch    = input.int(10, "Switch Margin (points)", minval = 0, maxval = 50, group = grpQ,
      tooltip = "A new target replaces the active DOL only if its probability is higher by at least this margin.")
+iMinDist   = input.float(0.5, "Min Distance to Activate (× Engine B ATR)", minval = 0.0, step = 0.1, group = grpQ,
+     tooltip = "A target already on top of price is not activated (it inflates the hit rate and gives no trade). An active DOL is kept until it is reached.")
 iUseADR    = input.bool(true, "ADR Reachability Filter", group = grpQ,
      tooltip = "Hide targets that would need more than a normal daily range (10-day ADR) to be reached today.")
 iMaxATR    = input.float(12.0, "Max Distance (× Engine B ATR)", minval = 1.0, step = 0.5, group = grpQ)
@@ -655,16 +657,16 @@ if doScore
         f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol)
 
 // ──────────────────────────────────────────────── SELF-LEARNING MEMORY ──────
-// DOL samples by Confirmation level (<60,60,70,80,90+)
-var array<int> kN = array.new<int>(5, 0)
-var array<int> kH = array.new<int>(5, 0)
+// DOL samples by Confirmation level (<60, 60, 65, 70, 75, 80, 85, 90+)
+var array<int> kN = array.new<int>(8, 0)
+var array<int> kH = array.new<int>(8, 0)
 // signal outcomes by safety stars (0-5)
 var array<int>   gN = array.new<int>(6, 0)
 var array<int>   gW = array.new<int>(6, 0)
 var array<float> gR = array.new<float>(6, 0.0)
 
 f_kB(float conv) =>
-    conv >= 90 ? 4 : conv >= 80 ? 3 : conv >= 70 ? 2 : conv >= 60 ? 1 : 0
+    conv >= 90 ? 7 : conv < 60 ? 0 : 1 + int((conv - 60.0) / 5.0)
 
 // PoT AI — online logistic regression (SGD). Starts equal to the model PoT
 // (weight 1 on its logit) and learns corrections from real outcomes.
@@ -688,7 +690,7 @@ f_pred(array<float> x) =>
 f_kRate(int b) =>
     int n = 0
     int h = 0
-    for j = b to 4
+    for j = b to 7
         n += kN.get(j)
         h += kH.get(j)
     [n, n > 0 ? 100.0 * h / n : 0.0]
@@ -750,18 +752,21 @@ array<int> rankIdx = nC > 0 ? convs.sort_indices(order.descending) : array.new<i
 
 // learned Confirmation threshold
 int   effMinConv = iMinConv
-[n70, r70] = f_kRate(2)
-[n80, r80] = f_kRate(3)
-[n90, r90] = f_kRate(4)
+// lowest level among 70 / 75 / 80 / 85 / 90 whose measured hit rate reaches the target
+[n70, r70] = f_kRate(3)
 if iThrMode == "Auto (learned)" and n70 >= iMinSamples
-    effMinConv := r70 >= iTargetHit ? 70 : n80 >= iMinSamples and r80 >= iTargetHit ? 80 : 90
-gateN    = effMinConv >= 90 ? n90 : effMinConv >= 80 ? n80 : effMinConv >= 70 ? n70 : 0
-gateRate = effMinConv >= 90 ? r90 : effMinConv >= 80 ? r80 : effMinConv >= 70 ? r70 : 0.0
+    effMinConv := 90
+    for b = 3 to 7
+        [nb, rb] = f_kRate(b)
+        if nb >= iMinSamples and rb >= iTargetHit
+            effMinConv := 60 + (b - 1) * 5
+            break
+[gateN, gateRate] = f_kRate(f_kB(effMinConv))
 
 // quality gate (slack > 0 = looser rule used to KEEP an already active DOL)
 f_gate(Cand c, float slack) =>
     c.conv > 0 and c.conv >= effMinConv - slack and c.cpot >= iMinPoT - slack and c.confs >= iMinConfs - (slack > 0 ? 1 : 0) and
-         (not iUseADR or c.adrR >= (slack > 0 ? -0.1 : 0.0))
+         (not iUseADR or c.adrR >= (slack > 0 ? -0.1 : 0.0)) and (slack > 0 or c.dist >= iMinDist)
 
 var string primKey  = ""
 var float  primLvl  = na
@@ -827,7 +832,7 @@ if barstate.isconfirmed and inLearn
         int taken = 0
         for k = 0 to nC - 1
             Cand sc = cs.get(rankIdx.get(k))
-            if sc.conv > 0
+            if sc.conv > 0 and sc.dist >= iMinDist
                 smL.push(f_edge(sc))
                 smD.push(sc.dir)
                 smB.push(bar_index)
