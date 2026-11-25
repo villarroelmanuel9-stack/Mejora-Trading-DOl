@@ -797,7 +797,9 @@ if barstate.isconfirmed and inLearn
 // ──────────────────────────────────────────── DAILY DOL COUNTER ─────────────
 // How many DOL targets were activated and touched since the open
 inNyCash   = f_in("0930-1600")
-countReset = iCountMode == "Trading day" ? timeframe.change("D") : inNyCash and not inNyCash[1]
+newTDay    = timeframe.change("D")
+nyOpenBar  = inNyCash and not inNyCash[1]
+countReset = iCountMode == "Trading day" ? newTDay : nyOpenBar
 countOn    = iCountMode == "Trading day" or inNyCash
 var int dHit = 0
 var int dNew = 0
