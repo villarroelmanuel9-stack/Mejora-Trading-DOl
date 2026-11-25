@@ -36,7 +36,14 @@ iFvgMin = input.float(0.25, "Min FVG Size (× engine ATR)", minval = 0.0, step =
 
 grpQ = "🎯 Quality Gates"
 iMinConv   = input.int(80, "Min Confirmation to Show DOL (%)", minval = 0, maxval = 100, group = grpQ)
-iMinPoT    = input.float(0.0, "Min PoT to Show DOL (%)", minval = 0.0, maxval = 95.0, step = 1.0, group = grpQ)
+iMinPoT    = input.float(60.0, "Min Probability (PoT AI) to Show DOL (%)", minval = 0.0, maxval = 95.0, step = 1.0, group = grpQ,
+     tooltip = "Learned probability that price reaches the DOL within the PoT horizon. Higher = fewer but more accurate DOLs.")
+iHold      = input.int(10, "Hold Tolerance (points)", minval = 0, maxval = 30, group = grpQ,
+     tooltip = "The active DOL stays active while its Confirmation / Probability are within this many points of the gate (stops flickering).")
+iSwitch    = input.int(10, "Switch Margin (points)", minval = 0, maxval = 50, group = grpQ,
+     tooltip = "A new target replaces the active DOL only if its probability is higher by at least this margin.")
+iUseADR    = input.bool(true, "ADR Reachability Filter", group = grpQ,
+     tooltip = "Hide targets that would need more than a normal daily range (10-day ADR) to be reached today.")
 iMaxATR    = input.float(12.0, "Max Distance (× Engine B ATR)", minval = 1.0, step = 0.5, group = grpQ)
 iHorizon   = input.int(120, "PoT Horizon (chart bars)", minval = 10, maxval = 2000, group = grpQ)
 iMergeTol  = input.float(0.25, "Cross-TF Merge Tolerance (× Engine B ATR)", minval = 0.0, step = 0.05, group = grpQ)
@@ -91,14 +98,14 @@ grpL = "🧠 Self-Learning (calibrates on your chart)"
 iLearnBars   = input.int(2000, "Learning Window (bars)", minval = 300, maxval = 20000, group = grpL,
      tooltip = "History used to measure how often DOLs are reached and how signals perform. Lower it if the script is slow.")
 iSampleEvery = input.int(10, "DOL Sample Every (bars)", minval = 1, maxval = 120, group = grpL)
-iPrior       = input.int(10, "Calibration Prior Strength", minval = 1, maxval = 100, group = grpL,
-     tooltip = "How many real samples are needed before the measured hit rate outweighs the model PoT.")
+iLr          = input.float(0.05, "AI Learning Rate", minval = 0.005, maxval = 0.5, step = 0.005, group = grpL,
+     tooltip = "Online logistic regression: how fast the PoT AI adapts to the measured results on this chart.")
 iThrMode     = input.string("Auto (learned)", "Confirmation Threshold", options = ["Fixed", "Auto (learned)"], group = grpL,
      tooltip = "Auto: picks the lowest Confirmation level (70 / 80 / 90) whose measured hit rate reaches the target. Until there is enough data it uses the fixed value.")
 iTargetHit   = input.int(70, "Target DOL Hit Rate (%)", minval = 40, maxval = 95, group = grpL)
 iMinSamples  = input.int(20, "Min Samples per Level", minval = 5, maxval = 500, group = grpL)
-iMinConfs    = input.int(4, "Min Confirmations (of 7)", minval = 0, maxval = 7, group = grpL,
-     tooltip = "1H bias · 15m bias · 4H bias · order flow · clear path · cross-TF confluence · killzone")
+iMinConfs    = input.int(5, "Min Confirmations (of 8)", minval = 0, maxval = 8, group = grpL,
+     tooltip = "1H bias · 15m bias · 4H bias · order flow · clear path · cross-TF confluence · killzone · within daily range (ADR)")
 iSigAdaptive = input.bool(true, "Hide Signal Setups with Negative Expectancy", group = grpL)
 iMinSigSamp  = input.int(8, "Min Signals per Setup", minval = 3, maxval = 100, group = grpL)
 iShowStats   = input.bool(true, "Self-Stats Rows in HUD", group = grpL)
@@ -438,7 +445,7 @@ biasA = nz(rawBiasA)
 biasB = nz(rawBiasB)
 biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = barmerge.lookahead_on))
 
-[pdh, pdl, pdt] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+[pdh, pdl, pdt, adr10] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1], ta.sma(high - low, 10)[1]], lookahead = barmerge.lookahead_on)
 [pwh, pwl, pwt] = request.security(syminfo.tickerid, "W", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
 
 [runHiA, runLoA] = f_run(iTfA)
@@ -490,6 +497,9 @@ flowPct = sVol > 0 ? 50.0 + 50.0 * sDelta / sVol : 50.0
 chg   = close - close[1]
 mu    = ta.sma(chg, 200)
 sigma = math.sqrt(math.max(0.0, ta.sma(chg * chg, 200) - mu * mu))
+// Kaufman efficiency ratio (trend strength 0-1) and its direction
+er    = nz(math.abs(close - close[20]) / math.sum(math.abs(nz(chg)), 20))
+erDir = close >= close[20] ? 1 : -1
 
 // killzones / news windows (filters only, nothing drawn)
 f_in(string sess) =>
@@ -497,16 +507,34 @@ f_in(string sess) =>
 inKZ   = f_in(kz1 + "," + kz2 + "," + kz3)
 inNews = f_in(iNews1 + "," + iNews2 + "," + iNews3)
 
-f_pot(float dist, int dir) =>
-    float s = nz(sigma) * math.sqrt(iHorizon)
+// intraday volatility seasonality: EWMA of the squared 1-bar change per NY hour
+var array<float> hVar = array.new<float>(24, na)
+if barstate.isconfirmed and not na(chg)
+    int   hNow = hour(time, iTz)
+    float hv0  = hVar.get(hNow)
+    hVar.set(hNow, na(hv0) ? chg * chg : hv0 + 0.03 * (chg * chg - hv0))
+
+// expected price spread over the next iHorizon bars, following the hourly profile
+f_horizonSigma() =>
+    int   tms_ = timeframe.in_seconds(timeframe.period) * 1000
+    int   step = math.max(1, int(iHorizon / 12))
+    float base = nz(sigma * sigma)
+    float v    = 0.0
+    for m = 0 to iHorizon - 1 by step
+        float hv = hVar.get(hour(time + m * tms_, iTz))
+        v += step * (na(hv) ? base : hv)
+    math.sqrt(v)
+
+f_pot(float dist, int dir, float sH) =>
+    float s = sH > 0 ? sH : nz(sigma) * math.sqrt(iHorizon)
     if iConsPoT
-        s := s * 0.85 * (inKZ ? 1.0 : 0.8)
+        s := s * 0.85
     float r = 0.0
     if s > 0
         float m = nz(mu) * dir * 0.5
         if iConsPoT
             m := math.min(0.0, m)        // only adverse drift counts
-        float e = math.min(50.0, 2.0 * m * dist / (sigma * sigma))
+        float e = math.min(50.0, 2.0 * m * dist / math.max(nz(sigma * sigma), 1e-12))
         r := f_ncdf((-dist + m * iHorizon) / s) + math.exp(e) * f_ncdf((-dist - m * iHorizon) / s)
     math.min(95.0, 100.0 * math.min(1.0, r))
 
@@ -527,8 +555,11 @@ type Cand
     float  conv   = 0.0
     float  pot    = 0.0
     float  dist   = 0.0
-    float  cpot   = 0.0      // calibrated PoT (model blended with measured hit rate)
-    int    confs  = 0        // independent confirmations (of 7)
+    float  cpot   = 0.0      // PoT AI: learned probability of reaching the level
+    int    confs  = 0        // independent confirmations (of 8)
+    float  lp     = 0.0      // logit of the model PoT
+    float  adrR   = 0.0      // room left inside the daily range (−1…1)
+    float  erA    = 0.0      // trend efficiency aligned with the target
 
 f_edge(Cand c) =>
     c.dir == 1 ? c.btm : c.top
@@ -575,6 +606,7 @@ inRecent = last_bar_index - bar_index <= recentBars
 doScore  = inLearn and (inRecent or bar_index % sampleEv == 0 or armDir != 0 or (tDir != 0 and bar_index % 5 == 0))
 tfAName = f_tfName(iTfA)
 tfBName = f_tfName(iTfB)
+sigH    = doScore ? f_horizonSigma() : 0.0
 
 array<Cand> cs = array.new<Cand>()
 if doScore
@@ -623,9 +655,7 @@ if doScore
         f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol)
 
 // ──────────────────────────────────────────────── SELF-LEARNING MEMORY ──────
-// DOL samples: model-PoT decile (10) and Confirmation level (<60,60,70,80,90+)
-var array<int> pN = array.new<int>(10, 0)
-var array<int> pH = array.new<int>(10, 0)
+// DOL samples by Confirmation level (<60,60,70,80,90+)
 var array<int> kN = array.new<int>(5, 0)
 var array<int> kH = array.new<int>(5, 0)
 // signal outcomes by safety stars (0-5)
@@ -633,14 +663,27 @@ var array<int>   gN = array.new<int>(6, 0)
 var array<int>   gW = array.new<int>(6, 0)
 var array<float> gR = array.new<float>(6, 0.0)
 
-f_pB(float pot) =>
-    math.max(0, math.min(9, int(pot / 10.0)))
 f_kB(float conv) =>
     conv >= 90 ? 4 : conv >= 80 ? 3 : conv >= 70 ? 2 : conv >= 60 ? 1 : 0
-// Bayesian blend: model PoT acts as a prior worth iPrior samples
-f_calib(float pot) =>
-    int b = f_pB(pot)
-    math.min(95.0, 100.0 * (pH.get(b) + iPrior * pot / 100.0) / (pN.get(b) + iPrior))
+
+// PoT AI — online logistic regression (SGD). Starts equal to the model PoT
+// (weight 1 on its logit) and learns corrections from real outcomes.
+// features: bias · logit(model PoT) · confirmation · confirmations · distance ·
+//           ADR room · trend efficiency · liquidity line (vs FVG) · killzone · tier
+var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+f_sig(float z) =>
+    1.0 / (1.0 + math.exp(-math.max(-30.0, math.min(30.0, z))))
+f_logit(float p) =>
+    float q = math.max(0.02, math.min(0.98, p))
+    math.log(q / (1.0 - q))
+f_feats(Cand c) =>
+    array.from(1.0, c.lp, c.conv / 100.0 - 0.7, c.confs / 8.0 - 0.5, c.dist / iMaxATR, c.adrR, c.erA, c.zone ? 0.0 : 1.0, inKZ ? 1.0 : 0.0, c.tier / 4.0)
+f_pred(array<float> x) =>
+    float z = 0.0
+    for j = 0 to 9
+        z += W.get(j) * x.get(j)
+    f_sig(z)
 // measured hit rate for Confirmation ≥ level bucket b
 f_kRate(int b) =>
     int n = 0
@@ -685,8 +728,11 @@ if nC > 0
                         nBlock += 1
             float sClear = math.max(0.0, 15.0 - 5.0 * nBlock)
             c.conv := math.min(100.0, sDepth + sAlign + sFlow + sProx + sClear)
-            c.pot  := f_pot(math.abs(edge - close), c.dir)
-            c.cpot := f_calib(c.pot)
+            c.pot  := f_pot(math.abs(edge - close), c.dir, sigH)
+            c.lp   := f_logit(c.pot / 100.0)
+            float adrV = nz(adr10)
+            c.adrR := adrV > 0 ? math.max(-1.0, math.min(1.0, c.dir == 1 ? (runLoD + adrV - edge) / adrV : (edge - (runHiD - adrV)) / adrV)) : 0.0
+            c.erA  := er * (erDir == c.dir ? 1.0 : -1.0)
             int cf = 0
             cf += biasA == c.dir ? 1 : 0
             cf += biasB == c.dir ? 1 : 0
@@ -695,7 +741,9 @@ if nC > 0
             cf += nBlock == 0 ? 1 : 0
             cf += c.merged > 0 or c.tier >= 3 ? 1 : 0
             cf += inKZ ? 1 : 0
+            cf += c.adrR >= 0 ? 1 : 0
             c.confs := cf
+            c.cpot  := math.min(95.0, 100.0 * f_pred(f_feats(c)))
         convs.push(c.conv)
 
 array<int> rankIdx = nC > 0 ? convs.sort_indices(order.descending) : array.new<int>()
@@ -710,54 +758,86 @@ if iThrMode == "Auto (learned)" and n70 >= iMinSamples
 gateN    = effMinConv >= 90 ? n90 : effMinConv >= 80 ? n80 : effMinConv >= 70 ? n70 : 0
 gateRate = effMinConv >= 90 ? r90 : effMinConv >= 80 ? r80 : effMinConv >= 70 ? r70 : 0.0
 
-int primI = -1
-int bestI = -1
-if nC > 0
-    bestI := rankIdx.get(0)
-    for k = 0 to nC - 1
-        Cand c = cs.get(rankIdx.get(k))
-        if c.conv >= effMinConv and c.cpot >= iMinPoT and c.confs >= iMinConfs and c.conv > 0
-            primI := rankIdx.get(k)
-            break
+// quality gate (slack > 0 = looser rule used to KEEP an already active DOL)
+f_gate(Cand c, float slack) =>
+    c.conv > 0 and c.conv >= effMinConv - slack and c.cpot >= iMinPoT - slack and c.confs >= iMinConfs - (slack > 0 ? 1 : 0) and
+         (not iUseADR or c.adrR >= (slack > 0 ? -0.1 : 0.0))
 
-// ─────────────────────────────────────── DOL SAMPLING (learn hit rates) ─────
-var array<float> smL = array.new<float>()
-var array<int>   smD = array.new<int>()
-var array<int>   smB = array.new<int>()
-var array<int>   smP = array.new<int>()
-var array<int>   smK = array.new<int>()
-if barstate.isconfirmed and inLearn
-    if smL.size() > 0
-        for i = smL.size() - 1 to 0
-            bool hit = smD.get(i) == 1 ? high >= smL.get(i) : low <= smL.get(i)
-            if hit or bar_index - smB.get(i) >= iHorizon
-                int pb = smP.get(i)
-                int kb = smK.get(i)
-                pN.set(pb, pN.get(pb) + 1)
-                kN.set(kb, kN.get(kb) + 1)
-                if hit
-                    pH.set(pb, pH.get(pb) + 1)
-                    kH.set(kb, kH.get(kb) + 1)
-                smL.remove(i)
-                smD.remove(i)
-                smB.remove(i)
-                smP.remove(i)
-                smK.remove(i)
-    if doScore and bar_index % sampleEv == 0 and bestI >= 0
-        Cand sc = cs.get(bestI)
-        if sc.conv > 0
-            smL.push(f_edge(sc))
-            smD.push(sc.dir)
-            smB.push(bar_index)
-            smP.push(f_pB(sc.pot))
-            smK.push(f_kB(sc.conv))
-
-// ─────────────────────────────────────────────────────── EVENTS / GHOSTS ────
 var string primKey  = ""
 var float  primLvl  = na
 var int    primDir  = 0
 var int    primT    = na
 var string primName = ""
+
+int primI = -1
+int bestI = -1
+int newI  = -1
+int curI  = -1
+if nC > 0
+    bestI := rankIdx.get(0)
+    for k = 0 to nC - 1
+        int ri = rankIdx.get(k)
+        if f_gate(cs.get(ri), 0.0)
+            newI := ri
+            break
+    // the active DOL keeps its place unless a clearly better target appears
+    if primKey != ""
+        for i = 0 to nC - 1
+            Cand c = cs.get(i)
+            if c.dir == primDir and math.abs(f_edge(c) - primLvl) <= iMergeTol * atrRef
+                curI := i
+                break
+    primI := newI
+    if curI >= 0 and f_gate(cs.get(curI), iHold)
+        bool better = newI >= 0 and newI != curI and cs.get(newI).cpot >= cs.get(curI).cpot + iSwitch
+        if not better
+            primI := curI
+
+// ─────────────────────────────────────── DOL SAMPLING (learn hit rates) ─────
+var array<float> smL = array.new<float>()
+var array<int>   smD = array.new<int>()
+var array<int>   smB = array.new<int>()
+var array<int>   smK = array.new<int>()
+var array<float> smX = array.new<float>()
+if barstate.isconfirmed and inLearn
+    if smL.size() > 0
+        for i = smL.size() - 1 to 0
+            bool hit = smD.get(i) == 1 ? high >= smL.get(i) : low <= smL.get(i)
+            if hit or bar_index - smB.get(i) >= iHorizon
+                int kb = smK.get(i)
+                kN.set(kb, kN.get(kb) + 1)
+                if hit
+                    kH.set(kb, kH.get(kb) + 1)
+                // SGD step, L2 pull toward the model prior
+                int   o = i * 10
+                float z = 0.0
+                for j = 0 to 9
+                    z += W.get(j) * smX.get(o + j)
+                float err = (hit ? 1.0 : 0.0) - f_sig(z)
+                for j = 0 to 9
+                    W.set(j, W.get(j) + iLr * (err * smX.get(o + j) - 0.01 * (W.get(j) - W0.get(j))))
+                for j = 0 to 9
+                    smX.remove(o)
+                smL.remove(i)
+                smD.remove(i)
+                smB.remove(i)
+                smK.remove(i)
+    // sample the 3 best targets of this bar (more data for the learner)
+    if doScore and bar_index % sampleEv == 0 and nC > 0
+        int taken = 0
+        for k = 0 to nC - 1
+            Cand sc = cs.get(rankIdx.get(k))
+            if sc.conv > 0
+                smL.push(f_edge(sc))
+                smD.push(sc.dir)
+                smB.push(bar_index)
+                smK.push(f_kB(sc.conv))
+                smX.concat(f_feats(sc))
+                taken += 1
+            if taken >= 3
+                break
+
+// ─────────────────────────────────────────────────────── EVENTS / GHOSTS ────
 var array<line>  ghostL  = array.new<line>()
 var array<label> ghostLb = array.new<label>()
 
@@ -782,11 +862,11 @@ if barstate.isconfirmed and inLearn
                 ghostLb.shift().delete()
         primKey := ""
     if doScore and primI >= 0
-        Cand   p = cs.get(primI)
-        string k = p.name + p.tf + str.tostring(f_edge(p))
-        if k != primKey
+        Cand  p    = cs.get(primI)
+        bool  same = primKey != "" and p.dir == primDir and math.abs(f_edge(p) - primLvl) <= iMergeTol * atrRef
+        if not same
             evNew := true
-        primKey  := k
+        primKey  := p.name + p.tf
         primLvl  := f_edge(p)
         primDir  := p.dir
         primT    := p.t
@@ -803,14 +883,32 @@ countReset = iCountMode == "Trading day" ? newTDay : nyOpenBar
 countOn    = iCountMode == "Trading day" or inNyCash
 var int dHit = 0
 var int dNew = 0
+var array<float> acL = array.new<float>()
+var array<int>   acD = array.new<int>()
 if countReset
     dHit := 0
     dNew := 0
+    acL.clear()
+    acD.clear()
 if barstate.isconfirmed and countOn
-    if evSwept
-        dHit += 1
+    // every DOL activated today counts as touched when price reaches it
+    if acL.size() > 0
+        for i = acL.size() - 1 to 0
+            if acD.get(i) == 1 ? high >= acL.get(i) : low <= acL.get(i)
+                dHit += 1
+                acL.remove(i)
+                acD.remove(i)
     if evNew
-        dNew += 1
+        bool dup = false
+        if acL.size() > 0
+            for i = 0 to acL.size() - 1
+                if acD.get(i) == primDir and math.abs(acL.get(i) - primLvl) <= iMergeTol * atrRef
+                    dup := true
+                    break
+        if not dup and acL.size() < 100
+            dNew += 1
+            acL.push(primLvl)
+            acD.push(primDir)
 
 // ─────────────────────────────────────────── ENTRY SIGNALS AT THE DOL ───────
 // Self-consistent logic:
@@ -1057,7 +1155,7 @@ if barstate.islast
         dLabels.push(label.new(int(p.t + (xR - p.t) / 2), edge, "1. " + p.name + " · " + str.tostring(bars) + " bars", xloc = xloc.bar_time,
              style = label.style_label_center, color = cBg, textcolor = color.new(cAcc, 25), size = size.tiny, text_font_family = font.family_monospace))
         dLabels.push(label.new(xR, edge, "◆ " + f_grade(p.conv) + "  " + p.name + (p.merged > 0 ? "  ⊕" + str.tostring(p.merged) : "") + "\n" +
-             p.tf + "  " + str.tostring(p.cpot, "#.0") + "%  ✓" + str.tostring(p.confs) + "/7", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
+             p.tf + "  " + str.tostring(p.cpot, "#.0") + "%  ✓" + str.tostring(p.confs) + "/8", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
              textcolor = cAcc, size = size.small, textalign = text.align_left, text_font_family = font.family_monospace))
 
     // ── candidate ladder (runner-ups)
@@ -1122,8 +1220,8 @@ if barstate.islast
                 f_hud(1, "◆ " + f_grade(s.conv) + "   " + s.name + " " + s.tf, str.tostring(edge, format.mintick), cAcc, cTxt, cRow)
             else
                 f_hud(1, "◇ WAITING ≥ " + str.tostring(effMinConv) + "%", "best " + s.name + " " + s.tf, cMute, cMute, cRow)
-            f_hud(2, "PoT " + str.tostring(iHorizon) + "b", f_bar(s.cpot) + " " + str.tostring(s.cpot, "#.0") + "%", cMute, vc, cBg)
-            f_hud(3, "Confirm ≥" + str.tostring(effMinConv) + " ✓" + str.tostring(s.confs) + "/7", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
+            f_hud(2, "PoT AI " + str.tostring(iHorizon) + "b", f_bar(s.cpot) + " " + str.tostring(s.cpot, "#.0") + "%", cMute, vc, cBg)
+            f_hud(3, "Confirm ≥" + str.tostring(effMinConv) + " ✓" + str.tostring(s.confs) + "/8", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
             f_hud(4, "Distance", str.tostring(s.dist, "#.##") + " × " + tfBName + " ATR " + (s.dir == 1 ? "↑" : "↓"), cMute, vc, cBg)
         else
             f_hud(1, "◇ NO TARGET", "in range", cMute, cMute, cRow)
@@ -1169,7 +1267,8 @@ if barstate.islast
             f_hud(17, "Signals", sN > 0 ? str.tostring(100.0 * sW / sN, "#") + "% · " + str.tostring(sR / sN, "+#.##;-#.##") + "R · n " + str.tostring(sN) : "learning…",
                  cMute, sR > 0 ? cAcc : sN > 0 ? cBear : cTxt, cBg)
         string cntLbl = iCountMode == "Trading day" ? "DOL today" : "DOL NY 9:30" + (inNyCash ? "" : " ·closed")
-        f_hud(18, cntLbl, "✓ " + str.tostring(dHit) + " touched / " + str.tostring(dNew) + " active", cMute, dHit > 0 ? cAcc : cTxt, cRow)
+        f_hud(18, cntLbl, "✓ " + str.tostring(dHit) + " / " + str.tostring(dNew) + (dNew > 0 ? " · " + str.tostring(100.0 * dHit / dNew, "#") + "%" : ""),
+             cMute, dNew > 0 and 100.0 * dHit / dNew >= iTargetHit ? cAcc : cTxt, cRow)
         if timeframe.in_seconds(timeframe.period) > 60
             f_hud(19, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
 
@@ -1192,7 +1291,7 @@ alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure b
 if evNew and primI >= 0
     Cand p = cs.get(primI)
     alert("DOL Engine Pro · " + (p.dir == 1 ? "▲ " : "▼ ") + p.name + " " + p.tf + " @ " + str.tostring(f_edge(p), format.mintick) +
-         " · Confirmation " + str.tostring(p.conv, "#") + "% (" + str.tostring(p.confs) + "/7) · PoT " + str.tostring(p.cpot, "#.0") + "%", alert.freq_once_per_bar_close)
+         " · Confirmation " + str.tostring(p.conv, "#") + "% (" + str.tostring(p.confs) + "/8) · PoT AI " + str.tostring(p.cpot, "#.0") + "%", alert.freq_once_per_bar_close)
 if evBuy or evSell
     alert("DOL Engine Pro · " + (evSell ? "SELL" : "BUY") + " " + syminfo.ticker + " @ " + str.tostring(sigEntry, format.mintick) +
          " · SL " + str.tostring(sigSL, format.mintick) + " · TP " + str.tostring(sigTP, format.mintick), alert.freq_once_per_bar_close)

@@ -41,6 +41,18 @@ El par SMT se puede cambiar en *Safety Filters*. Usa un símbolo con datos en ti
 - La volatilidad del PoT se calcula de forma incremental, con un solo cálculo de horario para killzones y otro para noticias.
 - SMT apagado por defecto, porque carga un segundo gráfico de 1m. Se activa en *Safety Filters*.
 
+### 🎯 Precisión del DOL (algoritmos)
+| Algoritmo | Qué hace |
+|---|---|
+| **Histéresis / compromiso** | Una vez activo, el DOL se mantiene mientras siga dentro de 10 puntos del umbral. Solo lo reemplaza un objetivo con al menos 10 puntos más de probabilidad. Así no salta ni parpadea |
+| **Contador honesto** | Cada DOL activado hoy cuenta como tocado si el precio llega aunque ya no sea el activo. Si un nivel se reactiva, no se cuenta dos veces. La fila muestra `✓ 17 / 22 · 77%` |
+| **ADR (rango diario promedio de 10 días)** | Filtro y 8.ª confirmación: descarta objetivos que exigirían más rango del normal en el día |
+| **Volatilidad por hora del día** | El PoT usa el perfil de volatilidad por hora de NY (EWMA) a lo largo del horizonte, en vez de una volatilidad fija |
+| **Kaufman Efficiency Ratio** | Fuerza de la tendencia hacia el objetivo, usada como dato para la IA |
+| **PoT AI (regresión logística en línea, SGD)** | Aprende con cada resultado real qué combinación de PoT, confirmación, confirmaciones, distancia, ADR, tendencia, tipo de nivel, killzone y temporalidad predice el toque. Arranca igual al PoT matemático y se corrige solo, con una regularización que lo mantiene estable |
+
+Por defecto, el DOL aparece solo con **PoT AI ≥ 60%**, **≥ 5 de 8 confirmaciones**, **dentro del ADR** y con la confirmación por encima del umbral automático.
+
 ### 🧠 Auto-aprendizaje (retroalimentación)
 El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
 
