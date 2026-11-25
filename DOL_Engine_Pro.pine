@@ -107,6 +107,8 @@ grpH = "📊 HUD"
 iShowHud = input.bool(true, "Show HUD", group = grpH)
 iHudPos  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpH)
 iHudSize = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group = grpH)
+iCountMode = input.string("Trading day", "DOL Counter Resets At", options = ["Trading day", "NY Open 09:30"], group = grpH,
+     tooltip = "Trading day: counts from the daily open (futures 18:00 NY, XAUUSD 17:00 NY) until the close. NY Open: counts only 09:30-16:00 New York.")
 
 grpF = "🌊 Order Flow"
 iFlowLen = input.int(30, "Delta Lookback (chart bars)", minval = 5, group = grpF)
@@ -565,7 +567,7 @@ f_fvgDepth(float top, float btm, float a) =>
 // score only on sample bars and while a setup / trade is in progress.
 var int armDir = 0
 var int tDir   = 0
-learnBars  = iPerf == "Fast" ? math.min(iLearnBars, 1000) : iPerf == "Balanced" ? math.min(iLearnBars, 2500) : iLearnBars
+learnBars  = iPerf == "Fast" ? math.min(iLearnBars, 1500) : iPerf == "Balanced" ? math.min(iLearnBars, 2500) : iLearnBars
 recentBars = iPerf == "Fast" ? 80 : iPerf == "Balanced" ? 150 : 250
 sampleEv   = iPerf == "Fast" ? math.max(iSampleEvery, 20) : iSampleEvery
 inLearn  = last_bar_index - bar_index <= learnBars
@@ -792,6 +794,22 @@ if barstate.isconfirmed and inLearn
     else if doScore
         primKey := ""
 
+// ──────────────────────────────────────────── DAILY DOL COUNTER ─────────────
+// How many DOL targets were activated and touched since the open
+inNyCash   = f_in("0930-1600")
+countReset = iCountMode == "Trading day" ? timeframe.change("D") : inNyCash and not inNyCash[1]
+countOn    = iCountMode == "Trading day" or inNyCash
+var int dHit = 0
+var int dNew = 0
+if countReset
+    dHit := 0
+    dNew := 0
+if barstate.isconfirmed and countOn
+    if evSwept
+        dHit += 1
+    if evNew
+        dNew += 1
+
 // ─────────────────────────────────────────── ENTRY SIGNALS AT THE DOL ───────
 // Self-consistent logic:
 //   1. A DOL is reached (liquidity swept) → setup is armed in the opposite way.
@@ -1001,7 +1019,7 @@ if iShowMS and barstate.isconfirmed and inLearn
 var array<line>  dLines  = array.new<line>()
 var array<label> dLabels = array.new<label>()
 var array<box>   dBoxes  = array.new<box>()
-var table hud = table.new(f_pos(iHudPos), 2, 19, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
+var table hud = table.new(f_pos(iHudPos), 2, 20, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
 
 f_hud(int r, string l, string v, color lc, color vc, color bg) =>
     table.cell(hud, 0, r, l, text_color = lc, text_halign = text.align_left, text_size = hudSize, bgcolor = bg, text_font_family = font.family_monospace)
@@ -1090,7 +1108,7 @@ if barstate.islast
 
     // ── HUD
     if iShowHud
-        table.clear(hud, 0, 0, 1, 18)
+        table.clear(hud, 0, 0, 1, 19)
         f_hud(0, "DOL ENGINE PRO", instName + " · " + f_tfName(timeframe.period), cAcc, cMute, cBg)
         int   si   = primI >= 0 ? primI : bestI
         bool  live = primI >= 0
@@ -1148,8 +1166,10 @@ if barstate.islast
                 sR += gR.get(j)
             f_hud(17, "Signals", sN > 0 ? str.tostring(100.0 * sW / sN, "#") + "% · " + str.tostring(sR / sN, "+#.##;-#.##") + "R · n " + str.tostring(sN) : "learning…",
                  cMute, sR > 0 ? cAcc : sN > 0 ? cBear : cTxt, cBg)
+        string cntLbl = iCountMode == "Trading day" ? "DOL today" : "DOL NY 9:30" + (inNyCash ? "" : " ·closed")
+        f_hud(18, cntLbl, "✓ " + str.tostring(dHit) + " touched / " + str.tostring(dNew) + " active", cMute, dHit > 0 ? cAcc : cTxt, cRow)
         if timeframe.in_seconds(timeframe.period) > 60
-            f_hud(18, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
+            f_hud(19, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
 
 // ──────────────────────────────────────────────── ORDER-FLOW IMBALANCE ──────
 imbUp = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol >= 0.5

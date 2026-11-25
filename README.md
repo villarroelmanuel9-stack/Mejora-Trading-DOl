@@ -51,7 +51,7 @@ El indicador **mide sus propios resultados en tu gráfico** (por defecto, las ú
 | 7 confirmaciones independientes: sesgo 1H, sesgo 15m, sesgo 4H, order flow, camino libre, confluencia entre temporalidades, killzone | El DOL solo aparece con **≥ 4 de 7** confirmaciones (ajustable) |
 | Resultado en R de cada señal según sus estrellas (★0–5), aunque no se muestre | Las configuraciones con **expectativa negativa se ocultan** cuando hay ≥ 8 casos. La etiqueta muestra el % histórico |
 
-El HUD agrega 2 filas: `DOL hit ≥80 auto · 74% · n 120` y `Signals · 58% · +0.31R · n 12`.
+El HUD tiene además la fila **DOL today**: `✓ 3 touched / 4 active` muestra cuántos DOL se tocaron y cuántos se activaron desde la apertura. Se reinicia en la apertura del día de trading o, si se elige, a las 09:30 NY, y en ese caso cuenta solo de 09:30 a 16:00. El HUD agrega 2 filas: `DOL hit ≥80 auto · 74% · n 120` y `Signals · 58% · +0.31R · n 12`.
 
 ### 📚 Investigación usada
 - Los extremos del día anterior se alcanzan en ~90% de las sesiones de NQ, y el rango overnight se rompe ~94% de los días. Por eso se subió la profundidad de PDH/PDL y de las sesiones.
