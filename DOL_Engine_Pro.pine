@@ -15,12 +15,16 @@
 //  Educational tool — not financial advice.
 // ════════════════════════════════════════════════════════════════════════════
 indicator("DOL Engine Pro · Draw on Liquidity", shorttitle = "DOL Engine Pro", overlay = true,
-     max_boxes_count = 100, max_lines_count = 200, max_labels_count = 200, max_bars_back = 500)
+     max_boxes_count = 100, max_lines_count = 200, max_labels_count = 200, max_bars_back = 500, calc_bars_count = 7000)
 
 // ─────────────────────────────────────────────────────────────── INPUTS ─────
 grpI = "📈 Instrument"
 iPreset = input.string("Auto", "Instrument Preset", options = ["Auto", "Nasdaq", "Gold (XAUUSD)", "Custom"], group = grpI,
      tooltip = "Auto detects Nasdaq (NQ, MNQ, NAS100, US100, USTEC) and Gold (XAUUSD, GOLD, GC, MGC) and sets killzones + SMT pair. Custom uses the killzones from Safety Filters.")
+
+grpP = "⚡ Performance"
+iPerf = input.string("Fast", "Performance Mode", options = ["Fast", "Balanced", "Full"], group = grpP,
+     tooltip = "Fast: runs on every TradingView plan (Basic/free has ~20 s of calculation time). Balanced / Full learn from more history but need a paid plan. If you see a time error, use Fast.")
 
 grpE = "⚙ Engines"
 iTfA    = input.timeframe("60", "Engine A (major)", group = grpE)
@@ -78,7 +82,7 @@ iUsePD   = input.bool(true, "Premium / Discount Filter", group = grpSF,
      tooltip = "SELL only if the sweep happened in premium (above the 2-day range midpoint), BUY only in discount.")
 iSmtSym  = input.symbol("", "SMT Symbol (blank = preset pair)", group = grpSF,
      tooltip = "Blank: Nasdaq → ES1! (futures) or SPX500 (CFD) · Gold → SI1! (futures) or XAGUSD (spot). Use a real-time symbol you have data for.")
-iSmtMode = input.string("Bonus", "SMT Divergence", options = ["Off", "Bonus", "Required"], group = grpSF)
+iSmtMode = input.string("Off", "SMT Divergence", options = ["Off", "Bonus", "Required"], group = grpSF)
 iSmtLen  = input.int(30, "SMT Lookback (bars)", minval = 5, maxval = 200, group = grpSF)
 iConsPoT = input.bool(true, "Conservative PoT", group = grpSF,
      tooltip = "Ignores favourable drift, trims volatility 15 % and reduces it outside killzones → PoT is harder to inflate.")
@@ -482,14 +486,14 @@ flowPct = sVol > 0 ? 50.0 + 50.0 * sDelta / sVol : 50.0
 
 // volatility for PoT
 chg   = close - close[1]
-sigma = ta.stdev(chg, 200)
 mu    = ta.sma(chg, 200)
+sigma = math.sqrt(math.max(0.0, ta.sma(chg * chg, 200) - mu * mu))
 
 // killzones / news windows (filters only, nothing drawn)
 f_in(string sess) =>
     not na(time(timeframe.period, sess, iTz))
-inKZ   = f_in(kz1) or f_in(kz2) or f_in(kz3)
-inNews = f_in(iNews1) or f_in(iNews2) or f_in(iNews3)
+inKZ   = f_in(kz1 + "," + kz2 + "," + kz3)
+inNews = f_in(iNews1 + "," + iNews2 + "," + iNews3)
 
 f_pot(float dist, int dir) =>
     float s = nz(sigma) * math.sqrt(iHorizon)
@@ -561,9 +565,12 @@ f_fvgDepth(float top, float btm, float a) =>
 // score only on sample bars and while a setup / trade is in progress.
 var int armDir = 0
 var int tDir   = 0
-inLearn  = last_bar_index - bar_index <= iLearnBars
-inRecent = last_bar_index - bar_index <= 200
-doScore  = inLearn and (inRecent or bar_index % iSampleEvery == 0 or armDir != 0 or (tDir != 0 and bar_index % 3 == 0))
+learnBars  = iPerf == "Fast" ? math.min(iLearnBars, 1000) : iPerf == "Balanced" ? math.min(iLearnBars, 2500) : iLearnBars
+recentBars = iPerf == "Fast" ? 80 : iPerf == "Balanced" ? 150 : 250
+sampleEv   = iPerf == "Fast" ? math.max(iSampleEvery, 20) : iSampleEvery
+inLearn  = last_bar_index - bar_index <= learnBars
+inRecent = last_bar_index - bar_index <= recentBars
+doScore  = inLearn and (inRecent or bar_index % sampleEv == 0 or armDir != 0 or (tDir != 0 and bar_index % 5 == 0))
 tfAName = f_tfName(iTfA)
 tfBName = f_tfName(iTfB)
 
@@ -734,7 +741,7 @@ if barstate.isconfirmed and inLearn
                 smB.remove(i)
                 smP.remove(i)
                 smK.remove(i)
-    if doScore and bar_index % iSampleEvery == 0 and bestI >= 0
+    if doScore and bar_index % sampleEv == 0 and bestI >= 0
         Cand sc = cs.get(bestI)
         if sc.conv > 0
             smL.push(f_edge(sc))
