@@ -1,0 +1,2015 @@
+//@version=6
+indicator("Trading DOL 1.0 + Perfil de Volumen + Order Flow + Order Blocks", shorttitle="DOL + VP + OF + OB", overlay=true, max_bars_back=500, max_boxes_count=500, max_labels_count=100, max_lines_count=100)
+
+// =====================================================================
+//  Trading DOL 1.0  +  Perfil de Volumen Compras vs Ventas
+//
+//  MODULO 1: Trading DOL 1.0 (sin cambios de logica)
+//  UN objetivo (BFVG / BeFVG / iBFVG / iBeFVG) + probabilidad de toque.
+//
+//  MODULO 2: Perfil de Volumen (al final del script, bloque "VP")
+//  Histograma compras (verde) / ventas (rojo), POC, VAH, VAL y zonas
+//  sombreadas verde/rojo segun quien domine. Usa variables, arrays,
+//  objetos de dibujo y tabla PROPIOS (prefijo "vp"): no comparte estado
+//  con el modulo DOL, asi que no se interrumpen entre si.
+//  NUEVO: el reparto compra/venta puede usar el DELTA real de cada vela
+//  (compra = (vol + delta)/2, venta = (vol - delta)/2) en vez del color.
+//
+//  NUEVO (conceptos ICT estudiados): PWH/PWL (semana previa) y PMH/PML (mes previo) como liquidez
+//  externa del DOL, con jerarquia dia < semana < mes tanto en el camino al target como en el peso de
+//  las barridas. Breaker blocks (BB) como zona propia con deteccion de UNICORN (breaker + FVG del mismo
+//  sentido solapados). Estructura BOS (continuacion) vs MSS (cambio de tendencia) en el panel.
+//
+//  MODULO 5: Session Highs & Lows (Asia / London / New York), inspirado en "Session Highs & Lows [Defined Edge]":
+//  maximo y minimo de cada sesion como lineas horizontales. La sesion en vivo (o la mas reciente de su tipo) se
+//  dibuja brillante y proyectada a la barra actual; las anteriores se atenuan y quedan fijas sobre su rango.
+//  Etiquetas con precio (vivas a la derecha, pasadas a la izquierda) y tabla con high, low, rango y rango %.
+//  Zona horaria por sesion (maneja el horario de verano). Solo graficos intradia.
+//  Ademas (ICT): los extremos de sesion alimentan el DOL como liquidez y sus barridas pesan en el POT.
+//
+//  MODULO 3: Order Flow (bloque "OF"): delta por vela, CVD, delta extremo,
+//  absorcion y divergencias delta/precio. Solo lee barDelta del DOL.
+//  NUEVO (investigacion de volume delta):
+//    - Delta % (delta / volumen): <5% balance, 5-10% zona gris, >=10% iniciativa.
+//    - Delta flip: cambio de signo del delta entre velas con delta% significativo.
+//    - Max / Min delta intravela: rechazo (el delta llego lejos y se devolvio).
+//    - Agotamiento: delta extremo seguido de una vela de giro con delta contrario.
+//    - Divergencia CVD por pivotes (precio hace nuevo pivote, CVD no lo confirma).
+//    - El score de Order Flow del POT ahora mezcla flujo ventana + delta% + eventos.
+//
+//  MODULO 4: Order Blocks (bloque "OB"): deteccion propia e independiente de
+//  OB alcistas/bajistas tras ruptura de estructura (BOS), con mitigacion,
+//  conteo de tests, ratio de volumen y delta de la vela del OB.
+//
+//  Glosario DOL:
+//   BFVG  = Bullish FVG (BISI)  -> soporte, queda debajo del precio
+//   BeFVG = Bearish FVG (SIBI)  -> resistencia, queda arriba del precio
+//   BSL   = Buy Side Liquidity (stops sobre maximos / EQH / PDH)
+//   SSL   = Sell Side Liquidity (stops bajo minimos / EQL / PDL)
+//   BOB / BeOB = Bullish / Bearish Order Block (flip a breaker al
+//                cerrar al otro lado de su 50% = mean threshold)
+//   BBR   = Bear Bull Ratio (distancia alcista / (alcista + bajista))
+//   MSS   = Market Structure Shift: cierre mas alla del ultimo swing
+//           contrario (con vela de desplazamiento) tras una barrida
+//
+//  POT = caminata aleatoria (distancia vs volatilidad) ajustada en
+//  log-odds por DOL, Order Flow, OB, Premium/Discount, HTF, FVG y BBR.
+//  DOL = BSL/SSL (pools, EQH/EQL, PDH/PDL, barridas ponderadas por MSS)
+//        + FVG mas alla del target.
+//  Contador de aciertos: compara el POT estimado con lo que paso de verdad.
+//  Heuristico: no esta calibrado con backtest.
+//
+//  FIX: los dibujos usan bar_index (no xloc.bar_time) y parten como
+//  maximo de bMin (250 velas atras) para no exceder el buffer historico.
+// =====================================================================
+
+// VISTA LIMPIA: por defecto solo se ve el Perfil de Volumen, el TARGET (caja + etiqueta) y el panel de contexto.
+// Los calculos (DOL, Order Flow, OB, POT) siguen activos por dentro; para volver a ver BSL/SSL, OB, FVG o marcas de
+// Order Flow, activa de nuevo sus casillas en los ajustes del indicador.
+// ===================== INPUTS =====================
+modeInput   = input.string("Day Trading", "Trading Mode (HTF bias)", options=["Swing", "Day Trading", "Scalping"], group="General")
+horizonBars = input.int(60, "POT Horizon (bars)", minval=5, maxval=500, group="General", tooltip="Barras en las que el precio debe llegar al target. Mas horizonte = mas POT.")
+touchMode   = input.string("Edge", "Touch Level", options=["Edge", "CE (50%)"], group="General", tooltip="Edge = primer contacto con el FVG. CE = consequent encroachment (50% del gap).")
+minDistAtr  = input.float(0.75, "Min Target Distance (x ATR)", minval=0.0, maxval=10.0, step=0.05, group="General")
+maxDistAtr  = input.float(8.0, "Max Target Distance (x ATR)", minval=1.0, maxval=30.0, step=0.5, group="General")
+capAtr      = input.float(5.0, "Ranking Distance Cap (x ATR)", minval=1.0, maxval=20.0, step=0.5, group="General", tooltip="El ranking usa POT x distancia (con tope) para que el gap mas cercano no gane siempre.")
+hystPct     = input.int(25, "Target Switch Hysteresis (%)", minval=0, maxval=200, group="General", tooltip="Un candidato debe superar el score del target actual en este % para reemplazarlo.")
+minPotShow  = input.int(75, "Show target only if POT >= (%)", minval=0, maxval=99, group="General", tooltip="El target (caja + etiqueta) solo se dibuja cuando el POT suavizado llega a este nivel. Se oculta de nuevo si baja 5 puntos por debajo (histeresis, evita parpadeo). 0 = mostrar siempre. Un umbral alto muestra menos targets, pero no garantiza acierto: revisa 'Acierto POT' en el panel.")
+calcBars    = input.int(300, "Calculation window (bars)", minval=50, maxval=5000, group="General", tooltip="El motor de targets (FVG/OB/POT) solo se calcula en las ultimas N velas. Evita el error RE10110 (script demasiado lento). Sube este valor solo si tu plan lo permite.")
+alertPot    = input.int(70, "POT Alert Threshold (%)", minval=1, maxval=99, group="General")
+
+minFvgAtr   = input.float(0.25, "Min FVG Displacement (x ATR)", minval=0.0, maxval=3.0, step=0.05, group="FVG / Order Blocks")
+useIfvg     = input.bool(true, "Invert FVG into iFVG (can be target)", group="FVG / Order Blocks")
+maxZones    = input.int(15, "Max Tracked FVGs", minval=5, maxval=100, group="FVG / Order Blocks")
+maxObs      = input.int(10, "Max Tracked Order Blocks", minval=5, maxval=60, group="FVG / Order Blocks")
+maxAgeBars  = input.int(500, "Max Zone Age (bars)", minval=50, maxval=5000, group="FVG / Order Blocks")
+obReachAtr  = input.float(2.0, "OB / FVG Support Reach (x ATR behind price)", minval=0.5, maxval=10.0, step=0.5, group="FVG / Order Blocks")
+
+pivotLeft   = input.int(5, "Pivot Left Bars", minval=2, maxval=20, group="Liquidity (DOL)")
+pivotRight  = input.int(5, "Pivot Right Bars", minval=2, maxval=20, group="Liquidity (DOL)")
+maxLiq      = input.int(20, "Max Tracked Liquidity Pools", minval=6, maxval=100, group="Liquidity (DOL)")
+sweepMem    = input.int(40, "Sweep Memory (bars)", minval=5, maxval=300, group="Liquidity (DOL)")
+eqTolAtr    = input.float(0.10, "Equal Highs/Lows Tolerance (x ATR)", minval=0.01, maxval=1.0, step=0.01, group="Liquidity (DOL)", tooltip="Dos pivotes a menos de esta distancia se fusionan en un pool EQH/EQL (liquidez mas fuerte).")
+useHtfLiq   = input.bool(true, "Include PWH/PWL + PMH/PML as liquidity (DOL)", group="Liquidity (DOL)", tooltip="Agrega maximos/minimos de la semana y el mes anteriores como liquidez externa. Peso: dia 1.0, semana 1.25, mes 1.5. Una barrida de semana/mes pesa mas que una de dia. El PDH/PDL siempre se usa.")
+showLiq     = input.bool(false, "Show nearest BSL / SSL lines", group="Liquidity (DOL)")
+fvgDolStr   = input.float(0.50, "FVG as DOL: strength (FVG beyond target)", minval=0.0, maxval=1.5, step=0.05, group="Liquidity (DOL)", tooltip="Fuerza con la que un BFVG/BeFVG sin tocar, mas alla del target, suma al DOL. 0 = desactivado.")
+
+mssFilter   = input.bool(true, "Weight sweeps by MSS confirmation", group="Market Structure (MSS)", tooltip="Activado: una barrida pesa 100% si hubo MSS, 50% mientras espera MSS y 25% si no hubo MSS. Desactivado: toda barrida pesa 100%.")
+mssWindow   = input.int(20, "MSS Window after sweep (bars)", minval=2, maxval=100, group="Market Structure (MSS)", tooltip="Barras que tiene el precio, despues de la barrida, para confirmar el MSS.")
+mssBodyAtr  = input.float(0.50, "MSS displacement candle body (x ATR)", minval=0.0, maxval=3.0, step=0.05, group="Market Structure (MSS)", tooltip="La vela que rompe la estructura debe cerrar en la direccion del MSS con cuerpo >= este multiplo del ATR. 0 = solo exige el cierre.")
+
+ofLen       = input.int(20, "Order Flow Window (bars)", minval=3, maxval=200, group="Order Flow")
+
+bbrLen      = input.int(20, "BBR Window (bars)", minval=3, maxval=200, group="BBR (Bear Bull Ratio)")
+bbrTrue     = input.bool(true, "True Range Mode (distancia high-low en vez de conteo de velas)", group="BBR (Bear Bull Ratio)")
+bbrSmooth   = input.int(5, "BBR Smoothing (WMA)", minval=1, maxval=50, group="BBR (Bear Bull Ratio)")
+
+showStats   = input.bool(true, "Show POT accuracy in panel", group="Accuracy Tracker", tooltip="Cada target nuevo es una prediccion: tocara el nivel dentro del horizonte con probabilidad POT. Se resuelve cuando el precio toca el nivel (acierto) o vence el horizonte (fallo).")
+
+wDol        = input.float(0.50, "Weight: DOL (BSL/SSL + FVG)", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wOf         = input.float(0.40, "Weight: Order Flow", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wOb         = input.float(0.35, "Weight: Order Blocks (BOB/BeOB)", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wPd         = input.float(0.30, "Weight: Premium/Discount (CE)", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wHtf        = input.float(0.25, "Weight: HTF Bias", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wFvg        = input.float(0.25, "Weight: FVG context (BFVG/BeFVG)", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+wBbr        = input.float(0.30, "Weight: BBR", minval=0.0, maxval=2.0, step=0.05, group="Probability Weights")
+
+bullColor   = input.color(color.new(color.teal, 0), "Upside Target Color", group="Visuals")
+bearColor   = input.color(color.new(color.orange, 0), "Downside Target Color", group="Visuals")
+bslColor    = input.color(color.new(color.blue, 0), "BSL Color", group="Visuals")
+sslColor    = input.color(color.new(color.fuchsia, 0), "SSL Color", group="Visuals")
+beObColor   = input.color(color.new(color.red, 0), "BeOB Color", group="Visuals")
+bObColor    = input.color(color.new(color.green, 0), "BOB Color", group="Visuals")
+labelSize   = input.string("normal", "Label Size", options=["tiny", "small", "normal", "large"], group="Visuals")
+showTip     = input.bool(true, "Show Evidence Breakdown in Label Tooltip", group="Visuals")
+showObZones = input.bool(false, "Show nearest BeOB / BOB", group="Visuals")
+showBrk     = input.bool(false, "Show nearest Breaker Blocks (BB) + Unicorn", group="Visuals")
+showAllFvg  = input.bool(false, "Show ALL tracked BFVG / BeFVG (not only the target)", group="Visuals")
+showPanel   = input.bool(true, "Show Context Panel", group="Visuals")
+panelPos    = input.string("Top Left", "Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Visuals")
+
+// ===================== INPUTS: PANEL MULTI-TEMPORALIDAD =====================
+tfOn        = input.bool(true, "Mostrar panel de temporalidades (1m / 15m / 1h / 4h)", group="MTF: Panel")
+tfPos       = input.string("Top Right", "Posicion del panel MTF", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Left", "Middle Right"], group="MTF: Panel")
+tfPosV      = tfPos == "Top Left" ? position.top_left : tfPos == "Top Right" ? position.top_right : tfPos == "Bottom Left" ? position.bottom_left : tfPos == "Middle Left" ? position.middle_left : tfPos == "Middle Right" ? position.middle_right : position.bottom_right
+
+// ===================== INPUTS: SESIONES (modulo 5) =====================
+sesOn       = input.bool(true, "Activar Session Highs & Lows", group="SES: Sesiones", tooltip="Solo funciona en graficos intradia (1m a 1h van mejor). Los niveles salen de barras cerradas y no se repintan al cerrar la sesion.")
+sesKeep     = input.int(2, "Sesiones pasadas a conservar (por sesion)", minval=0, maxval=5, group="SES: Sesiones")
+sesProject  = input.bool(true, "Proyectar la sesion mas reciente hasta la barra actual", group="SES: Sesiones")
+sesShade    = input.bool(true, "Sombrear el rango de cada sesion (zona horaria)", group="SES: Sesiones", tooltip="Dibuja un rectangulo suave desde la apertura hasta el cierre de cada sesion, entre su maximo y su minimo.")
+sesLblMode  = input.string("Etiqueta + precio", "Etiquetas", options=["Solo precio", "Etiqueta + precio"], group="SES: Sesiones")
+sesShowTbl  = input.bool(true, "Mostrar tabla de sesiones", group="SES: Sesiones")
+sesTblPos   = input.string("Bottom Left", "Posicion de la tabla de sesiones", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Left", "Middle Right"], group="SES: Sesiones")
+useSesLiq   = input.bool(true, "Usar maximos/minimos de sesion como liquidez (DOL)", group="SES: Sesiones", tooltip="Los extremos de la ultima sesion completada de cada tipo cuentan como BSL/SSL en el DOL: pesan en el camino al target y su barrida suma al POT.")
+sesLiqStr   = input.float(0.90, "Fuerza de la liquidez de sesion (DOL)", minval=0.0, maxval=1.5, step=0.05, group="SES: Sesiones")
+sesAsiaOn   = input.bool(true, "Asia", group="SES: Asia")
+sesAsiaHrs  = input.session("2000-0000", "Horario Asia", group="SES: Asia")
+sesAsiaTz   = input.string("America/New_York", "Zona horaria Asia", group="SES: Asia", tooltip="Ejemplos: America/New_York, Europe/London, Asia/Tokyo. Por defecto horarios ICT en hora de Nueva York.")
+sesAsiaCol  = input.color(#ff9800, "Color Asia (en vivo)", group="SES: Asia")
+sesAsiaPast = input.color(color.new(#ff9800, 55), "Color Asia (pasada)", group="SES: Asia")
+sesLdnOn    = input.bool(true, "London", group="SES: London")
+sesLdnHrs   = input.session("0200-0500", "Horario London", group="SES: London")
+sesLdnTz    = input.string("America/New_York", "Zona horaria London", group="SES: London")
+sesLdnCol   = input.color(#2196f3, "Color London (en vivo)", group="SES: London")
+sesLdnPast  = input.color(color.new(#2196f3, 55), "Color London (pasada)", group="SES: London")
+sesNyOn     = input.bool(true, "New York", group="SES: New York")
+sesNyHrs    = input.session("0830-1100", "Horario New York", group="SES: New York")
+sesNyTz     = input.string("America/New_York", "Zona horaria New York", group="SES: New York")
+sesNyCol    = input.color(#4caf50, "Color New York (en vivo)", group="SES: New York")
+sesNyPast   = input.color(color.new(#4caf50, 55), "Color New York (pasada)", group="SES: New York")
+sesPosV     = sesTblPos == "Top Left" ? position.top_left : sesTblPos == "Top Right" ? position.top_right : sesTblPos == "Bottom Right" ? position.bottom_right : sesTblPos == "Middle Left" ? position.middle_left : sesTblPos == "Middle Right" ? position.middle_right : position.bottom_left
+
+// ===================== INPUTS: PERFIL DE VOLUMEN (modulo independiente) =====================
+vpOn        = input.bool(true, "Activar Perfil de Volumen", group="VP: Perfil")
+vpLookback  = input.int(200, "Barras a analizar", minval=10, maxval=500, group="VP: Perfil", tooltip="Maximo 500: es el limite de historial del script.")
+vpRows      = input.int(40, "Numero de filas", minval=5, maxval=100, group="VP: Perfil")
+vpVaPct     = input.float(70.0, "Area de valor (%)", minval=10.0, maxval=100.0, group="VP: Perfil") / 100.0
+vpProfW     = input.int(40, "Ancho del perfil (barras)", minval=5, maxval=300, group="VP: Perfil")
+vpGap       = input.int(30, "Separacion a la derecha (barras)", minval=0, maxval=100, group="VP: Perfil", tooltip="Deja espacio para las etiquetas del modulo DOL. Subelo si se superponen.")
+vpPlace     = input.string("Derecha del precio", "Posicion", options=["Derecha del precio", "Sobre el grafico (izquierda)"], group="VP: Perfil")
+vpUseDelta  = input.bool(true, "Repartir compra/venta con el DELTA de cada vela", group="VP: Perfil", tooltip="Activado: compra = (volumen + delta)/2 y venta = (volumen - delta)/2, usando el delta intrabar (o su proxy). Desactivado: toda la vela cuenta como compra si cierra >= apertura, o como venta si no (metodo anterior).")
+
+vpShowZones = input.bool(true, "Sombrear zonas de alto volumen", group="VP: Zonas compra / venta")
+vpHvnPct    = input.float(60.0, "Umbral de zona (% del volumen maximo)", minval=10.0, maxval=100.0, group="VP: Zonas compra / venta") / 100.0
+
+vpBuyCol    = input.color(color.new(#00c853, 35), "Volumen de COMPRA", group="VP: Colores")
+vpSellCol   = input.color(color.new(#ff1744, 35), "Volumen de VENTA", group="VP: Colores")
+vpVaBuyCol  = input.color(color.new(#00e676, 10), "Compra dentro del Area de Valor", group="VP: Colores")
+vpVaSellCol = input.color(color.new(#ff5252, 10), "Venta dentro del Area de Valor", group="VP: Colores")
+vpZoneBuy   = input.color(color.new(#00c853, 88), "Zona dominada por COMPRAS", group="VP: Colores")
+vpZoneSell  = input.color(color.new(#ff1744, 88), "Zona dominada por VENTAS", group="VP: Colores")
+vpPocCol    = input.color(#ffd600, "POC", group="VP: Colores")
+vpVaCol     = input.color(#2962ff, "VAH / VAL", group="VP: Colores")
+
+vpShowPoc   = input.bool(true, "Mostrar POC", group="VP: Mostrar")
+vpShowVa    = input.bool(true, "Mostrar VAH / VAL", group="VP: Mostrar")
+vpShowTbl   = input.bool(true, "Mostrar tabla de resumen VP", group="VP: Mostrar")
+vpTblPos    = input.string("Bottom Right", "Posicion de la tabla VP", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="VP: Mostrar")
+vpPosV      = vpTblPos == "Top Left" ? position.top_left : vpTblPos == "Top Right" ? position.top_right : vpTblPos == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+// ===================== INPUTS: ORDER FLOW (modulo 3) =====================
+oflOn       = input.bool(true, "Activar Order Flow", group="OF: Order Flow")
+oflStdLen   = input.int(50, "Ventana de desviacion del delta (barras)", minval=10, maxval=300, group="OF: Order Flow")
+oflImbMult  = input.float(2.0, "Delta extremo (x desviacion estandar)", minval=0.5, maxval=5.0, step=0.1, group="OF: Order Flow", tooltip="Una vela tiene delta extremo cuando su delta supera este multiplo de la desviacion tipica reciente.")
+oflDivLen   = input.int(20, "Ventana de divergencia delta/precio (barras)", minval=5, maxval=200, group="OF: Order Flow")
+oflPctInit  = input.float(10.0, "Delta % de iniciativa (>=)", minval=1.0, maxval=50.0, step=0.5, group="OF: Order Flow", tooltip="Delta % = delta / volumen de la vela. Referencia usada en order flow: menos de 5% = balance, 5-10% = zona gris (mirar contexto), 10% o mas = iniciativa (un lado domina).")
+oflPctBal   = input.float(5.0, "Delta % de balance (<)", minval=0.5, maxval=20.0, step=0.5, group="OF: Order Flow")
+oflFadeRatio = input.float(0.35, "Rechazo de delta: ratio de cierre vs max/min", minval=0.0, maxval=1.0, step=0.05, group="OF: Order Flow", tooltip="Si el delta intravela llego a un maximo (o minimo) extremo y la vela cierra con un delta menor a este ratio de ese extremo, los agresores fueron rechazados (solo con datos intrabar).")
+oflPvLen    = input.int(5, "Pivote para divergencia CVD (izq/der)", minval=2, maxval=20, group="OF: Order Flow", tooltip="Divergencia por pivotes: el precio hace un pivote mas alto (o mas bajo) y el CVD en ese pivote no lo confirma.")
+oflBlend    = input.float(0.30, "Peso de delta% + eventos en el score del POT", minval=0.0, maxval=1.0, step=0.05, group="OF: Order Flow", tooltip="0 = el score de Order Flow del POT usa solo el flujo de la ventana (como antes). Mayor = mezcla delta% de la vela y los eventos recientes (absorcion, divergencia, flip, rechazo, agotamiento).")
+oflShowImb  = input.bool(false, "Marcar delta extremo (triangulos)", group="OF: Mostrar")
+oflShowAbs  = input.bool(false, "Marcar absorcion (circulos)", group="OF: Mostrar")
+oflShowDiv  = input.bool(false, "Marcar divergencias CVD (rombos)", group="OF: Mostrar")
+oflShowNew  = input.bool(false, "Marcar flip / rechazo / agotamiento", group="OF: Mostrar")
+oflShowTbl  = input.bool(false, "Mostrar tabla de Order Flow", group="OF: Mostrar")
+oflTblPos   = input.string("Middle Right", "Posicion de la tabla OF", options=["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group="OF: Mostrar")
+oflBuyCol   = input.color(#00e676, "Color compradores", group="OF: Mostrar")
+oflSellCol  = input.color(#ff5252, "Color vendedores", group="OF: Mostrar")
+oflPosV     = oflTblPos == "Top Left" ? position.top_left : oflTblPos == "Top Right" ? position.top_right : oflTblPos == "Middle Left" ? position.middle_left : oflTblPos == "Middle Right" ? position.middle_right : oflTblPos == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+// ===================== INPUTS: ORDER BLOCKS (modulo 4) =====================
+blkOn        = input.bool(false, "Activar Order Blocks", group="OB: Order Blocks")
+blkPivot     = input.int(5, "Pivote para estructura (izq/der)", minval=2, maxval=20, group="OB: Order Blocks", tooltip="Los swings se confirman con esta cantidad de barras a cada lado. Un cierre mas alla del ultimo swing = ruptura de estructura (BOS) y genera un OB.")
+blkLook      = input.int(20, "Busqueda del OB hacia atras (barras)", minval=5, maxval=50, group="OB: Order Blocks", tooltip="El OB es la ultima vela contraria cerca del extremo del movimiento que rompio la estructura.")
+blkBodyOnly  = input.bool(false, "Usar solo el cuerpo de la vela (sin mechas)", group="OB: Order Blocks")
+blkMinAtr    = input.float(0.15, "Tamano minimo del OB (x ATR)", minval=0.0, maxval=5.0, step=0.05, group="OB: Order Blocks")
+blkMaxAtrSz  = input.float(4.0, "Tamano maximo del OB (x ATR)", minval=0.5, maxval=20.0, step=0.5, group="OB: Order Blocks")
+blkMitMode   = input.string("Cierre", "Invalidacion del OB", options=["Cierre", "Mecha"], group="OB: Order Blocks", tooltip="Cierre: el OB se elimina cuando una vela cierra al otro lado. Mecha: basta con que la mecha lo atraviese.")
+blkMaxTrack  = input.int(10, "Maximo de OB activos", minval=1, maxval=15, group="OB: Order Blocks")
+blkMaxAge    = input.int(300, "Edad maxima del OB (barras)", minval=20, maxval=2000, group="OB: Order Blocks")
+blkShowLbl   = input.bool(false, "Mostrar etiqueta (volumen, delta, tests)", group="OB: Mostrar")
+blkShowMid   = input.bool(false, "Mostrar linea del 50% del OB", group="OB: Mostrar")
+blkShowTap   = input.bool(false, "Marcar retest del OB (flechas)", group="OB: Mostrar")
+blkBullCol   = input.color(#00bcd4, "Color OB alcista", group="OB: Mostrar")
+blkBearCol   = input.color(#ab47bc, "Color OB bajista", group="OB: Mostrar")
+
+// ===================== CORE SERIES =====================
+atrVal   = ta.atr(14)
+sigmaBar = ta.stdev(ta.change(close), 100)
+sigmaUse = (na(sigmaBar) or sigmaBar <= 0) ? nz(atrVal) * 0.6 : sigmaBar
+
+// Marcas de tiempo auxiliares: se dibuja con xloc.bar_time para no consultar el historial al graficar
+int bMin = math.max(0, bar_index - 250)   // FIX: limite izquierdo de dibujo (por bar_index, sin consultar time historico)
+// FIX: fuerza buffer historico completo en las series que usan los dibujos/arrays (evita limites auto-inferidos de 300-470)
+max_bars_back(time, 500)
+max_bars_back(close, 500)
+max_bars_back(high, 500)
+max_bars_back(low, 500)
+max_bars_back(open, 500)      // VP: el perfil de volumen recorre open/volume con offset dinamico
+max_bars_back(volume, 500)    // VP
+
+// ---- HTF bias (non-repainting: last closed HTF bar) ----
+htfRaw = modeInput == "Swing" ? "W" : modeInput == "Day Trading" ? "D" : "60"
+htfUse = timeframe.in_seconds(htfRaw) > timeframe.in_seconds() ? htfRaw : timeframe.period
+
+f_bias(src, emaVal) =>
+    src > emaVal ? 1 : src < emaVal ? -1 : 0
+
+htfBias = request.security(syminfo.tickerid, htfUse, f_bias(close[1], ta.ema(close, 50)[1]), lookahead=barmerge.lookahead_on)
+
+// ---- Previous day high / low (external liquidity: PDH = BSL, PDL = SSL) ----
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_on)
+pmh = request.security(syminfo.tickerid, "M", high[1], lookahead=barmerge.lookahead_on)
+pml = request.security(syminfo.tickerid, "M", low[1], lookahead=barmerge.lookahead_on)
+
+// ---- Order flow: delta from intrabar data (fallback: close-location proxy) ----
+ltfSec = timeframe.in_seconds()
+ltf    = ltfSec <= 60 ? timeframe.period : ltfSec <= 900 ? "1" : ltfSec <= 14400 ? "5" : "15"
+ltO = ltfSec <= 60 ? array.new_float(0) : request.security_lower_tf(syminfo.tickerid, ltf, open)
+ltC = ltfSec <= 60 ? array.new_float(0) : request.security_lower_tf(syminfo.tickerid, ltf, close)
+ltV = ltfSec <= 60 ? array.new_float(0) : request.security_lower_tf(syminfo.tickerid, ltf, volume)
+
+f_delta(o, c, v) =>
+    float d = 0.0
+    int n = array.size(v)
+    if n > 1
+        for k = 0 to n - 1
+            float vv = nz(array.get(v, k))
+            float oo = array.get(o, k)
+            float cc = array.get(c, k)
+            d += cc > oo ? vv : cc < oo ? -vv : 0.0
+    d
+
+// Max / Min delta intravela: extremos del delta acumulado mientras se formaba la vela
+f_deltaMM(o, c, v) =>
+    float run = 0.0
+    float mx = 0.0
+    float mn = 0.0
+    int n = array.size(v)
+    if n > 1
+        for k = 0 to n - 1
+            float vv = nz(array.get(v, k))
+            float oo = array.get(o, k)
+            float cc = array.get(c, k)
+            run += cc > oo ? vv : cc < oo ? -vv : 0.0
+            mx := math.max(mx, run)
+            mn := math.min(mn, run)
+    [mx, mn]
+
+float proxyDelta = high > low ? volume * (2.0 * close - high - low) / (high - low) : 0.0
+float barDelta   = array.size(ltV) > 1 ? f_delta(ltO, ltC, ltV) : proxyDelta
+max_bars_back(barDelta, 500)   // VP / OB: acceso historico con offset dinamico al delta
+[mmX, mmN] = f_deltaMM(ltO, ltC, ltV)
+float dMax       = array.size(ltV) > 1 ? mmX : math.max(barDelta, 0.0)
+float dMin       = array.size(ltV) > 1 ? mmN : math.min(barDelta, 0.0)
+float dSum       = math.sum(barDelta, ofLen)
+float vSum       = math.sum(volume, ofLen)
+float flow       = vSum > 0 ? dSum / vSum : 0.0
+float flowSd     = ta.stdev(flow, 100)
+float ofScoreBase = flowSd > 0 ? math.max(-1.0, math.min(1.0, flow / (2.0 * flowSd))) : 0.0
+
+// Delta % de la vela (delta / volumen) suavizado: +-oflPctInit % = score +-1
+float barPct     = volume > 0 ? barDelta / volume : 0.0
+float pctEma     = nz(ta.ema(barPct, 5))
+float pctScore   = math.max(-1.0, math.min(1.0, pctEma / (oflPctInit / 100.0)))
+
+// Sesgo por eventos de order flow (absorcion, divergencia, flip, rechazo, agotamiento); decae 10% por vela.
+// Se actualiza en el modulo 3 (al final del script); aqui solo se lee el valor de la vela anterior.
+var float oflEvBias = 0.0
+
+float ofScore    = math.max(-1.0, math.min(1.0, (1.0 - oflBlend) * ofScoreBase + oflBlend * (0.5 * pctScore + 0.5 * oflEvBias)))
+
+// ---- BBR (Bear Bull Ratio): cuota alcista = dist. alcista / (alcista + bajista) ----
+float bbrBullPart = close > open ? (bbrTrue ? high - low : 1.0) : 0.0
+float bbrBearPart = close < open ? (bbrTrue ? high - low : 1.0) : 0.0
+float bbrBullSum  = nz(math.sum(bbrBullPart, bbrLen))
+float bbrBearSum  = nz(math.sum(bbrBearPart, bbrLen))
+float bbrTot      = bbrBullSum + bbrBearSum
+float bbrRaw      = bbrTot > 0 ? bbrBullSum / bbrTot : 0.5
+float bbrSm       = nz(ta.wma(bbrRaw, bbrSmooth), 0.5)
+float bbrAvg      = ta.cum(bbrRaw) / (bar_index + 1)
+float bbrSd       = ta.stdev(bbrRaw, 100)
+float bbrScore    = bbrSd > 0 ? math.max(-1.0, math.min(1.0, (bbrSm - 0.5) / (2.0 * bbrSd))) : 0.0
+
+// ---- Swings -> dealing range (Premium / Discount, CE) ----
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+var float swH = na
+var float swL = na
+if not na(ph)
+    swH := ph
+if not na(pl)
+    swL := pl
+bool rangeOk = not na(swH) and not na(swL) and swH > swL
+float pdPos  = rangeOk ? math.max(-1.0, math.min(1.0, (close - (swH + swL) / 2.0) / ((swH - swL) / 2.0))) : 0.0
+
+// ===================== STATE =====================
+// FVG zones (dir +1 = BFVG / support-type, -1 = BeFVG / resistance-type)
+var float[] zTop  = array.new_float(0)
+var float[] zBot  = array.new_float(0)
+var int[]   zDir  = array.new_int(0)
+var int[]   zBorn = array.new_int(0)
+var int[]   zTime = array.new_int(0)
+var int[]   zId   = array.new_int(0)
+var bool[]  zInv  = array.new_bool(0)
+var bool[]  zHit  = array.new_bool(0)
+var int idCounter = 0
+
+// Order blocks (pol +1 = BOB supportive, -1 = BeOB resistive; flips to breaker on mean-threshold close)
+var float[] oTop  = array.new_float(0)
+var float[] oBot  = array.new_float(0)
+var int[]   oPol  = array.new_int(0)
+var bool[]  oBrk  = array.new_bool(0)
+var int[]   oBorn = array.new_int(0)
+var int[]   oTime = array.new_int(0)
+
+// Liquidity pools (dir +1 = BSL above highs, -1 = SSL below lows; str >= 2 = EQH/EQL)
+var float[] liqPx   = array.new_float(0)
+var int[]   liqDir  = array.new_int(0)
+var int[]   liqStr  = array.new_int(0)
+var int[]   liqTime = array.new_int(0)
+// Sesiones (modulo 5): sesion en curso por tipo (0 Asia, 1 London, 2 New York) y sesiones completadas
+var float[] sCH   = array.new_float(3, na)
+var float[] sCL   = array.new_float(3, na)
+var int[]   sCB0  = array.new_int(3, 0)
+var int[]   sCB1  = array.new_int(3, 0)
+var bool[]  sAct  = array.new_bool(3, false)
+var int[]   sPK   = array.new_int(0)
+var float[] sPH   = array.new_float(0)
+var float[] sPL   = array.new_float(0)
+var int[]   sPB0  = array.new_int(0)
+var int[]   sPB1  = array.new_int(0)
+var float[] sesLastH = array.new_float(3, na)   // ultimo maximo completado por sesion (liquidez BSL)
+var float[] sesLastL = array.new_float(3, na)   // ultimo minimo completado por sesion (liquidez SSL)
+var int sweepSig = 0     // +1 = SSL swept (draw up), -1 = BSL swept (draw down)
+var int sweepBar = -1
+var float sweepW = 1.0      // jerarquia de la ultima barrida: pool/dia 1.0, semana 1.25, mes 1.5
+var string sweepTag = ""    // nivel barrido (PDH, PWL, PMH...); vacio = pool de pivotes
+
+// MSS tras la barrida: 0 = sin barrida, 1 = esperando MSS, 2 = confirmado, 3 = sin MSS (vencio o fallo)
+var int   mssState = 0
+var float mssRef   = na      // swing que debe romperse (ultimo swing high tras SSL barrida / swing low tras BSL barrida)
+var float mssInv   = na      // extremo de la barrida: un cierre mas alla invalida el MSS
+var int   mssArm   = -1      // barra de la barrida
+var int   mssDir   = 0       // ultimo MSS confirmado: +1 alcista, -1 bajista
+var int   mssBar   = -1
+
+// Contador de aciertos: predicciones pendientes y estadistica por tramo de POT (0: <50%, 1: 50-70%, 2: >=70%)
+var float[] pLvl   = array.new_float(0)
+var int[]   pDirA  = array.new_int(0)
+var int[]   pStart = array.new_int(0)
+var float[] pPotA  = array.new_float(0)
+var int[]   stN    = array.new_int(3, 0)
+var int[]   stH    = array.new_int(3, 0)
+var float[] stP    = array.new_float(3, 0.0)
+
+var int tgtId    = -1
+var int tgtSince = -1000
+
+// Objetos de dibujo auxiliares (se limpian y redibujan en la ultima barra)
+var array<box>   xBox = array.new<box>()
+var array<line>  xLin = array.new<line>()
+var array<label> xLbl = array.new<label>()
+
+// Eventos de esta barra (para alertas)
+bool newBFvg     = false
+bool newBeFvg    = false
+bool newBOb      = false
+bool newBeOb     = false
+bool bslSweptNow = false
+bool sslSweptNow = false
+bool newMssBull  = false
+bool newMssBear  = false
+
+// Niveles externos (dia / semana / mes) y sus pesos: arrays globales que se actualizan UNA vez por barra
+// (antes se creaban dentro de f_eval en cada llamada, lo que hacia el script demasiado lento)
+var float[]  gHi    = array.new_float(3, na)
+var float[]  gLo    = array.new_float(3, na)
+var float[]  gWPath = array.from(1.0, 1.25, 1.5)
+var float[]  gWOpp  = array.from(0.5, 0.65, 0.8)
+var string[] gTagH  = array.from("PDH", "PWH", "PMH")
+var string[] gTagL  = array.from("PDL", "PWL", "PML")
+array.set(gHi, 0, pdh)
+array.set(gHi, 1, pwh)
+array.set(gHi, 2, pmh)
+array.set(gLo, 0, pdl)
+array.set(gLo, 1, pwl)
+array.set(gLo, 2, pml)
+bool calcOn = barstate.islast or bar_index >= last_bar_index - calcBars
+
+// ===================== HELPERS =====================
+f_ncdf(x) =>
+    float t = 1.0 / (1.0 + 0.2316419 * math.abs(x))
+    float w = 0.3989422804014327 * math.exp(-x * x / 2.0)
+    float q = w * t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    x >= 0.0 ? 1.0 - q : q
+
+f_lvl(zt, zb, zd) =>
+    touchMode == "CE (50%)" ? (zt + zb) / 2.0 : (zd == -1 ? zb : zt)
+
+f_size(s) =>
+    s == "tiny" ? size.tiny : s == "small" ? size.small : s == "large" ? size.large : size.normal
+
+// Tag de evidencia para el label: check si apoya al target, cruz si va en contra
+f_tag(nm, v) =>
+    v >= 0.3 ? nm + "✔ " : v <= -0.3 ? nm + "✖ " : ""
+
+// Tramo del POT para el contador de aciertos
+f_bucket(p) =>
+    p >= 0.70 ? 2 : p >= 0.50 ? 1 : 0
+
+// Texto "acierto%·n" de un tramo
+f_bkTxt(k) =>
+    int n = array.get(stN, k)
+    n == 0 ? "-" : str.tostring(math.round(100.0 * array.get(stH, k) / n)) + "%·" + str.tostring(n)
+
+f_rmZone(i) =>
+    array.remove(zTop, i)
+    array.remove(zBot, i)
+    array.remove(zDir, i)
+    array.remove(zBorn, i)
+    array.remove(zTime, i)
+    array.remove(zId, i)
+    array.remove(zInv, i)
+    array.remove(zHit, i)
+
+f_pushZone(pTop, pBot, pDir, pBorn, pTime, pId) =>
+    array.push(zTop, pTop)
+    array.push(zBot, pBot)
+    array.push(zDir, pDir)
+    array.push(zBorn, pBorn)
+    array.push(zTime, pTime)
+    array.push(zId, pId)
+    array.push(zInv, false)
+    array.push(zHit, false)
+    if array.size(zTop) > maxZones
+        f_rmZone(0)
+
+f_rmOb(i) =>
+    array.remove(oTop, i)
+    array.remove(oBot, i)
+    array.remove(oPol, i)
+    array.remove(oBrk, i)
+    array.remove(oBorn, i)
+    array.remove(oTime, i)
+
+f_pushOb(pTop, pBot, pPol, pBorn, pTime) =>
+    array.push(oTop, pTop)
+    array.push(oBot, pBot)
+    array.push(oPol, pPol)
+    array.push(oBrk, false)
+    array.push(oBorn, pBorn)
+    array.push(oTime, pTime)
+    if array.size(oTop) > maxObs
+        f_rmOb(0)
+
+f_rmLiq(i) =>
+    array.remove(liqPx, i)
+    array.remove(liqDir, i)
+    array.remove(liqStr, i)
+    array.remove(liqTime, i)
+
+// Agrega un pool BSL/SSL; si hay otro a distancia <= tolerancia se fusiona (EQH/EQL)
+f_addLiq(px, dir, pTime) =>
+    bool merged = false
+    int n = array.size(liqPx)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(liqDir, k) == dir and math.abs(array.get(liqPx, k) - px) <= eqTolAtr * nz(atrVal)
+                float cur = array.get(liqPx, k)
+                array.set(liqPx, k, dir == 1 ? math.max(cur, px) : math.min(cur, px))
+                array.set(liqStr, k, array.get(liqStr, k) + 1)
+                merged := true
+                break
+    if not merged
+        array.push(liqPx, px)
+        array.push(liqDir, dir)
+        array.push(liqStr, 1)
+        array.push(liqTime, pTime)
+        if array.size(liqPx) > maxLiq
+            array.shift(liqPx)
+            array.shift(liqDir)
+            array.shift(liqStr)
+            array.shift(liqTime)
+    merged
+
+// BSL mas cercano arriba (wantDir=1) o SSL mas cercano abajo (wantDir=-1). Incluye PDH/PDL.
+f_nearLiq(wantDir) =>
+    float rPx = na
+    int rStr = 0
+    int rTime = bar_index
+    string rTag = ""
+    int n = array.size(liqPx)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(liqDir, k) == wantDir
+                float px = array.get(liqPx, k)
+                bool ok = wantDir == 1 ? px > close : px < close
+                if ok and (na(rPx) or (wantDir == 1 ? px < rPx : px > rPx))
+                    rPx := px
+                    rStr := array.get(liqStr, k)
+                    rTime := array.get(liqTime, k)
+                    rTag := wantDir == 1 ? (rStr >= 2 ? "EQH" : "BSL") : (rStr >= 2 ? "EQL" : "SSL")
+    float[] hlv = wantDir == 1 ? array.from(pdh, pwh, pmh, array.get(sesLastH, 0), array.get(sesLastH, 1), array.get(sesLastH, 2)) : array.from(pdl, pwl, pml, array.get(sesLastL, 0), array.get(sesLastL, 1), array.get(sesLastL, 2))
+    string[] htg = wantDir == 1 ? array.from("PDH", "PWH", "PMH", "ASIA H", "LDN H", "NY H") : array.from("PDL", "PWL", "PML", "ASIA L", "LDN L", "NY L")
+    for k = 0 to 5
+        if k == 0 or (k <= 2 and useHtfLiq) or (k >= 3 and useSesLiq)
+            float hc = array.get(hlv, k)
+            bool hok = not na(hc) and (wantDir == 1 ? hc > close : hc < close)
+            if hok and (na(rPx) or (wantDir == 1 ? hc < rPx : hc > rPx))
+                rPx := hc
+                rStr := k == 0 ? 1 : 2
+                rTime := bar_index - 30
+                rTag := array.get(htg, k)
+    [rPx, rStr, rTime, rTag]
+
+// BeFVG mas cercano arriba (wantDir=-1) o BFVG mas cercano abajo (wantDir=1)
+f_nearFvg(wantDir) =>
+    float rLv = na
+    string rTag = ""
+    int n = array.size(zTop)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(zDir, k) == wantDir and not array.get(zHit, k)
+                float lv = f_lvl(array.get(zTop, k), array.get(zBot, k), wantDir)
+                bool ok = wantDir == -1 ? lv > close : lv < close
+                if ok and (na(rLv) or (wantDir == -1 ? lv < rLv : lv > rLv))
+                    rLv := lv
+                    rTag := (array.get(zInv, k) ? "i" : "") + (wantDir == 1 ? "BFVG" : "BeFVG")
+    [rLv, rTag]
+
+// Indice del BeOB (wantPol=-1) o BOB (wantPol=1) mas cercano al precio
+f_nearOb(wantPol) =>
+    int rI = -1
+    float rD = 1.0e10
+    int n = array.size(oTop)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(oPol, k) == wantPol
+                float hi = array.get(oTop, k)
+                float lo = array.get(oBot, k)
+                bool ok = wantPol == -1 ? hi > close : lo < close
+                float dd = wantPol == -1 ? math.max(0.0, lo - close) : math.max(0.0, close - hi)
+                if ok and dd < rD
+                    rD := dd
+                    rI := k
+    rI
+
+// Breaker block mas cercano: wantPol=1 alcista (soporte, abajo), -1 bajista (resistencia, arriba)
+f_nearBrk(wantPol) =>
+    int rI = -1
+    float rD = 1.0e10
+    int n = array.size(oTop)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(oPol, k) == wantPol and array.get(oBrk, k)
+                float hi = array.get(oTop, k)
+                float lo = array.get(oBot, k)
+                bool ok = wantPol == -1 ? hi > close : lo < close
+                float dd = wantPol == -1 ? math.max(0.0, lo - close) : math.max(0.0, close - hi)
+                if ok and dd < rD
+                    rD := dd
+                    rI := k
+    rI
+
+// Unicorn: el breaker se solapa con un FVG del mismo sentido (BFVG para BB alcista, BeFVG para BB bajista)
+f_unicorn(i) =>
+    bool u = false
+    if i >= 0
+        float hi = array.get(oTop, i)
+        float lo = array.get(oBot, i)
+        int p = array.get(oPol, i)
+        int n = array.size(zTop)
+        if n > 0
+            for k = 0 to n - 1
+                if array.get(zDir, k) == p and array.get(zBot, k) < hi and array.get(zTop, k) > lo
+                    u := true
+                    break
+    u
+
+f_clearDrawings() =>
+    for b in xBox
+        box.delete(b)
+    array.clear(xBox)
+    for ln in xLin
+        line.delete(ln)
+    array.clear(xLin)
+    for lb in xLbl
+        label.delete(lb)
+    array.clear(xLbl)
+
+f_drawOb(i, col, nm, xRight) =>
+    float hi = array.get(oTop, i)
+    float lo = array.get(oBot, i)
+    int born = math.max(array.get(oBorn, i), bMin)   // FIX
+    bool brk = array.get(oBrk, i)
+    float mid = (hi + lo) / 2.0
+    array.push(xBox, box.new(born, hi, xRight, lo, border_color=col, border_width=1, bgcolor=color.new(col, 88)))
+    array.push(xLin, line.new(born, mid, xRight, mid, color=color.new(col, 30), style=line.style_dotted, width=1))
+    array.push(xLbl, label.new(xRight, mid, nm + (brk and not str.contains(nm, "BB") ? " brk" : ""), style=label.style_label_left, color=color.new(col, 100), textcolor=col, size=size.small))
+
+f_distTxt(px) =>
+    str.tostring(px, format.mintick) + "  (" + (px >= close ? "+" : "") + str.tostring((px - close) / atrVal, "0.0") + " ATR)"
+
+f_row(t, r, k, v, c) =>
+    table.cell(t, 0, r, k, text_color=color.new(color.white, 20), text_halign=text.align_left, text_size=size.small)
+    table.cell(t, 1, r, v, text_color=c, text_halign=text.align_left, text_size=size.small)
+
+// ---- Probability engine: returns [POT, base, eDOL, eOF, eOB, ePD, eHTF, eBBR, eFVG, level, distATR, travelDir] ----
+f_eval(i) =>
+    float zt = array.get(zTop, i)
+    float zb = array.get(zBot, i)
+    int zd   = array.get(zDir, i)
+    float lvl = f_lvl(zt, zb, zd)
+    int d = zd == -1 ? 1 : -1                      // direccion que debe recorrer el precio para llegar a la zona
+    float dist = math.abs(lvl - close)
+    float distAtr = dist / atrVal
+
+    // Base POT: principio de reflexion, P(touch) = 2 * (1 - Phi(dist / (sigma * sqrt(N))))
+    float zs = dist / (sigmaUse * math.sqrt(horizonBars))
+    float pBase = math.max(0.001, math.min(0.999, 2.0 * (1.0 - f_ncdf(zs))))
+
+    // DOL: barrida reciente (ponderada por MSS) + BSL/SSL mas alla del target (EQH/EQL pesan mas) - pool opuesto cercano
+    float sweepConf = not mssFilter ? 1.0 : mssState == 2 ? 1.0 : mssState == 1 ? 0.5 : 0.25
+    float eSweep = 0.0
+    if sweepBar >= 0
+        int sAge = bar_index - sweepBar
+        if sAge < sweepMem
+            eSweep := d * sweepSig * (1.0 - sAge / sweepMem) * sweepConf * sweepW
+    float pathVal = 0.0
+    float oppVal = 0.0
+    int nLiq = array.size(liqPx)
+    if nLiq > 0
+        for k = 0 to nLiq - 1
+            float px = array.get(liqPx, k)
+            int pDirK = array.get(liqDir, k)
+            int pStr = array.get(liqStr, k)
+            if pDirK == d
+                if (d == 1 and px >= lvl) or (d == -1 and px <= lvl)
+                    pathVal := math.max(pathVal, pStr >= 2 ? 1.25 : 1.0)
+            else if math.abs(px - close) < dist * 0.5
+                oppVal := math.max(oppVal, pStr >= 2 ? 0.75 : 0.5)
+    // Liquidez externa por jerarquia: dia (PDH/PDL) < semana (PWH/PWL) < mes (PMH/PML)
+    for k = 0 to 2
+        if k == 0 or useHtfLiq
+            float hv = array.get(gHi, k)
+            float lw = array.get(gLo, k)
+            if d == 1
+                if not na(hv) and hv > close and hv >= lvl
+                    pathVal := math.max(pathVal, array.get(gWPath, k))
+                if not na(lw) and lw < close and math.abs(lw - close) < dist * 0.5
+                    oppVal := math.max(oppVal, array.get(gWOpp, k))
+            else
+                if not na(lw) and lw < close and lw <= lvl
+                    pathVal := math.max(pathVal, array.get(gWPath, k))
+                if not na(hv) and hv > close and math.abs(hv - close) < dist * 0.5
+                    oppVal := math.max(oppVal, array.get(gWOpp, k))
+
+    // Liquidez de sesion (Asia / London / NY): ultimo maximo y minimo completado de cada una
+    if useSesLiq
+        for k = 0 to 2
+            float sH2 = array.get(sesLastH, k)
+            float sL2 = array.get(sesLastL, k)
+            if d == 1
+                if not na(sH2) and sH2 > close and sH2 >= lvl
+                    pathVal := math.max(pathVal, sesLiqStr)
+                if not na(sL2) and sL2 < close and math.abs(sL2 - close) < dist * 0.5
+                    oppVal := math.max(oppVal, 0.5 * sesLiqStr)
+            else
+                if not na(sL2) and sL2 < close and sL2 <= lvl
+                    pathVal := math.max(pathVal, sesLiqStr)
+                if not na(sH2) and sH2 > close and math.abs(sH2 - close) < dist * 0.5
+                    oppVal := math.max(oppVal, 0.5 * sesLiqStr)
+
+    // FVG como DOL: otro FVG del mismo tipo que el target, mas alla de el, tambien atrae al precio
+    bool fvgBeyond = false
+    int nZb = array.size(zTop)
+    if nZb > 0
+        for k = 0 to nZb - 1
+            if k != i and not array.get(zHit, k)
+                int kdb = array.get(zDir, k)
+                float lvlB = f_lvl(array.get(zTop, k), array.get(zBot, k), kdb)
+                bool beyond = d == 1 ? lvlB > lvl : lvlB < lvl
+                if kdb == -d and beyond and math.abs(lvlB - close) <= maxDistAtr * 1.5 * atrVal
+                    fvgBeyond := true
+    float eDol = math.max(-1.0, math.min(1.0, 0.55 * eSweep + 0.45 * (pathVal + (fvgBeyond ? fvgDolStr : 0.0) - oppVal)))
+
+    // Order flow: presion de delta en la direccion del recorrido
+    float eOf = d * ofScore
+
+    // Order blocks: OB/breaker opuesto entre precio y target = obstaculo; OB a favor detras del precio = soporte
+    int nObst = 0
+    int nSupp = 0
+    float bandLo = math.min(close, lvl)
+    float bandHi = math.max(close, lvl)
+    int nOb = array.size(oTop)
+    if nOb > 0
+        for k = 0 to nOb - 1
+            float oMid = (array.get(oTop, k) + array.get(oBot, k)) / 2.0
+            int oP = array.get(oPol, k)
+            if oP == -d and oMid > bandLo and oMid < bandHi
+                nObst += 1
+            else if oP == d
+                if d == 1 and oMid <= close and oMid >= close - obReachAtr * atrVal
+                    nSupp += 1
+                else if d == -1 and oMid >= close and oMid <= close + obReachAtr * atrVal
+                    nSupp += 1
+    float eOb = math.max(-1.0, math.min(1.0, (nSupp > 0 ? 0.5 : 0.0) - 0.5 * math.min(2, nObst)))
+
+    // FVG: BFVG/BeFVG a favor detras del precio = apoyo; FVG opuesto entre precio y target = obstaculo
+    int nFsup = 0
+    int nFobs = 0
+    int nZk = array.size(zTop)
+    if nZk > 0
+        for k = 0 to nZk - 1
+            if k != i and not array.get(zHit, k)
+                float kMid = (array.get(zTop, k) + array.get(zBot, k)) / 2.0
+                int kd = array.get(zDir, k)
+                if kd == -d and kMid > bandLo and kMid < bandHi
+                    nFobs += 1
+                else if kd == d
+                    if d == 1 and kMid <= close and kMid >= close - obReachAtr * atrVal
+                        nFsup += 1
+                    else if d == -1 and kMid >= close and kMid <= close + obReachAtr * atrVal
+                        nFsup += 1
+    float eFvg = math.max(-1.0, math.min(1.0, (nFsup > 0 ? 0.5 : 0.0) - 0.5 * math.min(2, nFobs)))
+
+    // Premium / Discount: subir desde discount, bajar desde premium
+    float ePd = -d * pdPos
+
+    // HTF bias
+    float eHtf = d * htfBias
+
+    // BBR: sesgo de velas alcistas vs bajistas en la direccion del recorrido
+    float eBbr = d * bbrScore
+
+    float tilt = wDol * eDol + wOf * eOf + wOb * eOb + wPd * ePd + wHtf * eHtf + wFvg * eFvg + wBbr * eBbr
+    float lg = math.log(pBase / (1.0 - pBase)) + tilt
+    float p = 1.0 / (1.0 + math.exp(-lg))
+    [p, pBase, eDol, eOf, eOb, ePd, eHtf, eBbr, eFvg, lvl, distAtr, d]
+
+// ===================== LIQUIDITY: SWEEPS + NEW POOLS (solo en barra confirmada) =====================
+// Solo al cierre de barra: evita que en tiempo real un mismo pivote se agregue en cada tick y se fusione como EQH/EQL falso.
+if barstate.isconfirmed
+    int nL = array.size(liqPx)
+    if nL > 0
+        for i = nL - 1 to 0
+            float lPx = array.get(liqPx, i)
+            int lDir = array.get(liqDir, i)
+            bool hitUp = lDir == 1 and high > lPx
+            bool hitDn = lDir == -1 and low < lPx
+            if hitUp or hitDn
+                if hitUp and close < lPx
+                    // BSL barrida (bajista): esperar MSS bajista = cierre bajo el ultimo swing low
+                    sweepSig := -1
+                    sweepBar := bar_index
+                    sweepW := 1.0
+                    sweepTag := ""
+                    bslSweptNow := true
+                    mssState := na(swL) ? 0 : 1
+                    mssRef := swL
+                    mssInv := high
+                    mssArm := bar_index
+                else if hitDn and close > lPx
+                    // SSL barrida (alcista): esperar MSS alcista = cierre sobre el ultimo swing high
+                    sweepSig := 1
+                    sweepBar := bar_index
+                    sweepW := 1.0
+                    sweepTag := ""
+                    sslSweptNow := true
+                    mssState := na(swH) ? 0 : 1
+                    mssRef := swH
+                    mssInv := low
+                    mssArm := bar_index
+                f_rmLiq(i)
+    // Barridas de liquidez externa (PDH/PDL, PWH/PWL, PMH/PML): mecha mas alla del nivel y cierre del lado contrario
+    for k = 0 to 2
+        if k == 0 or useHtfLiq
+            float shv = array.get(gHi, k)
+            float slv = array.get(gLo, k)
+            if not na(shv) and high > shv and close < shv and high[1] <= shv
+                sweepSig := -1
+                sweepBar := bar_index
+                sweepW := 1.0 + 0.25 * k
+                sweepTag := array.get(gTagH, k)
+                bslSweptNow := true
+                mssState := na(swL) ? 0 : 1
+                mssRef := swL
+                mssInv := high
+                mssArm := bar_index
+            else if not na(slv) and low < slv and close > slv and low[1] >= slv
+                sweepSig := 1
+                sweepBar := bar_index
+                sweepW := 1.0 + 0.25 * k
+                sweepTag := array.get(gTagL, k)
+                sslSweptNow := true
+                mssState := na(swH) ? 0 : 1
+                mssRef := swH
+                mssInv := low
+                mssArm := bar_index
+    // Barridas de extremos de sesion (Asia / London / NY): mecha mas alla y cierre del lado contrario
+    if useSesLiq
+        float[] sHL = array.from(array.get(sesLastH, 0), array.get(sesLastH, 1), array.get(sesLastH, 2))
+        float[] sLL = array.from(array.get(sesLastL, 0), array.get(sesLastL, 1), array.get(sesLastL, 2))
+        string[] sNm = array.from("ASIA", "LDN", "NY")
+        for k = 0 to 2
+            float xh = array.get(sHL, k)
+            float xl = array.get(sLL, k)
+            if not na(xh) and high > xh and close < xh and high[1] <= xh
+                sweepSig := -1
+                sweepBar := bar_index
+                sweepW := 1.1
+                sweepTag := array.get(sNm, k) + " H"
+                bslSweptNow := true
+                mssState := na(swL) ? 0 : 1
+                mssRef := swL
+                mssInv := high
+                mssArm := bar_index
+            else if not na(xl) and low < xl and close > xl and low[1] >= xl
+                sweepSig := 1
+                sweepBar := bar_index
+                sweepW := 1.1
+                sweepTag := array.get(sNm, k) + " L"
+                sslSweptNow := true
+                mssState := na(swH) ? 0 : 1
+                mssRef := swH
+                mssInv := low
+                mssArm := bar_index
+    if not na(ph)
+        f_addLiq(ph, 1, bar_index - pivotRight)
+    if not na(pl)
+        f_addLiq(pl, -1, bar_index - pivotRight)
+
+// ===================== MSS: confirmacion de estructura tras la barrida =====================
+if barstate.isconfirmed and mssState == 1
+    bool bullBrk = sweepSig == 1 and close > mssRef and close > open and (close - open) >= mssBodyAtr * nz(atrVal)
+    bool bearBrk = sweepSig == -1 and close < mssRef and close < open and (open - close) >= mssBodyAtr * nz(atrVal)
+    bool mssFailed = (sweepSig == 1 and close < mssInv) or (sweepSig == -1 and close > mssInv)
+    bool mssExpired = bar_index - mssArm > mssWindow
+    if bullBrk
+        mssState := 2
+        mssDir := 1
+        mssBar := bar_index
+        newMssBull := true
+    else if bearBrk
+        mssState := 2
+        mssDir := -1
+        mssBar := bar_index
+        newMssBear := true
+    else if mssFailed or mssExpired
+        mssState := 3
+
+// ===================== ESTRUCTURA: BOS (continuacion) vs MSS (cambio de tendencia) =====================
+// Cierre mas alla del ultimo swing. Si va a favor de la tendencia previa = BOS; si la invierte = MSS.
+var float stRefH = na
+var float stRefL = na
+var bool  stHBrk = true
+var bool  stLBrk = true
+var int   stTrend = 0
+var int   stEvDir = 0
+var int   stEvBar = -1
+var string stEvTxt = "-"
+if not na(ph)
+    stRefH := ph
+    stHBrk := false
+if not na(pl)
+    stRefL := pl
+    stLBrk := false
+if barstate.isconfirmed
+    if not stHBrk and close > stRefH
+        stHBrk := true
+        stEvTxt := (stTrend == -1 ? "MSS" : "BOS") + " alcista"
+        stTrend := 1
+        stEvDir := 1
+        stEvBar := bar_index
+    else if not stLBrk and close < stRefL
+        stLBrk := true
+        stEvTxt := (stTrend == 1 ? "MSS" : "BOS") + " bajista"
+        stTrend := -1
+        stEvDir := -1
+        stEvBar := bar_index
+
+// ===================== ORDER BLOCK LIFECYCLE =====================
+int nO = array.size(oTop)
+if nO > 0
+    for i = nO - 1 to 0
+        float oHi = array.get(oTop, i)
+        float oLo = array.get(oBot, i)
+        int oPi = array.get(oPol, i)
+        bool oIsBrk = array.get(oBrk, i)
+        float oMidI = (oHi + oLo) / 2.0
+        if bar_index - array.get(oBorn, i) > maxAgeBars
+            f_rmOb(i)
+        else if not oIsBrk
+            if oPi == 1 and close < oMidI
+                array.set(oPol, i, -1)
+                array.set(oBrk, i, true)
+            else if oPi == -1 and close > oMidI
+                array.set(oPol, i, 1)
+                array.set(oBrk, i, true)
+        else if (oPi == -1 and close > oHi) or (oPi == 1 and close < oLo)
+            f_rmOb(i)
+
+// ===================== FVG LIFECYCLE (touch / inversion / expiry) =====================
+bool tgtHitNow = false
+int nZ = array.size(zTop)
+if nZ > 0
+    for i = nZ - 1 to 0
+        float zt = array.get(zTop, i)
+        float zb = array.get(zBot, i)
+        int zd = array.get(zDir, i)
+        bool zInvI = array.get(zInv, i)
+        bool zHitI = array.get(zHit, i)
+        bool tooOld = bar_index - array.get(zBorn, i) > maxAgeBars
+        bool crossed = (zd == 1 and close < zb) or (zd == -1 and close > zt)
+        if tooOld
+            f_rmZone(i)
+        else if crossed
+            if useIfvg and not zInvI
+                array.set(zDir, i, -zd)
+                array.set(zInv, i, true)
+                array.set(zHit, i, false)
+            else
+                f_rmZone(i)
+        else if not zHitI
+            float lv = f_lvl(zt, zb, zd)
+            bool touched = zd == -1 ? high >= lv : low <= lv
+            if touched
+                array.set(zHit, i, true)
+                if array.get(zId, i) == tgtId
+                    tgtHitNow := true
+
+// ===================== NEW FVG (BFVG / BeFVG) + ORDER BLOCK (BOB / BeOB) =====================
+bool gapBull = high[2] < low
+bool gapBear = low[2] > high
+float bodyD  = math.abs(close[1] - open[1])
+float rngD   = high[1] - low[1]
+bool strongD = rngD > 0 and bodyD / rngD >= 0.5 and bodyD >= atrVal * minFvgAtr
+bool dispBull = strongD and close[1] > open[1]
+bool dispBear = strongD and close[1] < open[1]
+
+if barstate.isconfirmed and gapBull and dispBull
+    idCounter += 1
+    newBFvg := true
+    f_pushZone(low, high[2], 1, bar_index - 2, time[2], idCounter)
+    // BOB: ultima vela bajista antes del desplazamiento alcista
+    int kB = close[2] < open[2] ? 2 : close[3] < open[3] ? 3 : close[4] < open[4] ? 4 : 0
+    if kB > 0
+        float obT = kB == 2 ? high[2] : kB == 3 ? high[3] : high[4]
+        float obB = kB == 2 ? low[2] : kB == 3 ? low[3] : low[4]
+        int obTm = kB == 2 ? time[2] : kB == 3 ? time[3] : time[4]
+        f_pushOb(obT, obB, 1, bar_index - kB, obTm)
+        newBOb := true
+
+if barstate.isconfirmed and gapBear and dispBear
+    idCounter += 1
+    newBeFvg := true
+    f_pushZone(low[2], high, -1, bar_index - 2, time[2], idCounter)
+    // BeOB: ultima vela alcista antes del desplazamiento bajista
+    int kR = close[2] > open[2] ? 2 : close[3] > open[3] ? 3 : close[4] > open[4] ? 4 : 0
+    if kR > 0
+        float obT2 = kR == 2 ? high[2] : kR == 3 ? high[3] : high[4]
+        float obB2 = kR == 2 ? low[2] : kR == 3 ? low[3] : low[4]
+        int obTm2 = kR == 2 ? time[2] : kR == 3 ? time[3] : time[4]
+        f_pushOb(obT2, obB2, -1, bar_index - kR, obTm2)
+        newBeOb := true
+
+// ===================== TARGET SELECTION (single target + hysteresis) =====================
+int bestI = -1
+float bestSc = -1.0
+int curI = -1
+float curSc = -1.0
+float curDist = na
+int nZ2 = array.size(zTop)
+if calcOn and nZ2 > 0 and not na(atrVal) and atrVal > 0
+    for i = 0 to nZ2 - 1
+        if not array.get(zHit, i)
+            bool isCur = array.get(zId, i) == tgtId
+            [cP, cPb, cDol, cOf, cOb, cPd, cHtf, cBbr, cFvg, cLvl, cDist, cDir] = f_eval(i)
+            bool okDist = isCur ? cDist <= maxDistAtr * 1.5 : (cDist >= minDistAtr and cDist <= maxDistAtr)
+            if okDist
+                float sc = cP * math.min(cDist, capAtr)
+                if sc > bestSc
+                    bestSc := sc
+                    bestI := i
+                if isCur
+                    curI := i
+                    curSc := sc
+                    curDist := cDist
+
+bool targetChanged = false
+int newId = tgtId
+bool lockCur = curI != -1 and curDist < minDistAtr      // el precio ya esta cerca: mantener target hasta tocarlo
+if curI != -1
+    if not lockCur and bestI != -1 and bestI != curI and bestSc > curSc * (1.0 + hystPct / 100.0)
+        newId := array.get(zId, bestI)
+else
+    newId := bestI != -1 ? array.get(zId, bestI) : -1
+if newId != tgtId
+    targetChanged := newId != -1
+    tgtId := newId
+    tgtSince := bar_index
+
+// ---- Final evaluation of the active target ----
+float fP   = na
+float fPb  = na
+float fDol = na
+float fOf  = na
+float fOb  = na
+float fPd  = na
+float fHtf = na
+float fBbr = na
+float fFvg = na
+float fLvl = na
+int   fDir = 0
+if tgtId != -1 and not na(atrVal) and atrVal > 0
+    int tI = array.indexof(zId, tgtId)
+    if tI != -1
+        [rP, rPb, rDol, rOf, rOb, rPd, rHtf, rBbr, rFvg, rLvl, rDist, rDir] = f_eval(tI)
+        fP := rP
+        fPb := rPb
+        fDol := rDol
+        fOf := rOf
+        fOb := rOb
+        fPd := rPd
+        fHtf := rHtf
+        fBbr := rBbr
+        fFvg := rFvg
+        fLvl := rLvl
+        fDir := rDir
+
+var float pShown = na
+if na(fP)
+    pShown := na
+else if targetChanged or na(pShown)
+    pShown := fP
+else
+    pShown := pShown + 0.35 * (fP - pShown)
+
+// FIX: acceso historico en ambito global (se evalua en TODAS las barras). Antes pShown[5] solo se evaluaba
+// en la ultima barra dentro de barstate.islast, y Pine no puede dimensionar el buffer asi -> error de offset.
+float pShown5 = pShown[5]
+max_bars_back(pShown, 500)
+
+// ===================== ACCURACY TRACKER (POT estimado vs lo que paso) =====================
+// Cada target nuevo = una prediccion: "el precio tocara el nivel dentro de horizonBars velas con prob. POT".
+// Se resuelve por nivel (no depende de si el target cambia despues). Solo en barra confirmada.
+if barstate.isconfirmed
+    int nPd = array.size(pLvl)
+    if nPd > 0
+        for i = nPd - 1 to 0
+            int pAge = bar_index - array.get(pStart, i)
+            if pAge >= 1
+                float lvT = array.get(pLvl, i)
+                bool hitT = array.get(pDirA, i) == 1 ? high >= lvT : low <= lvT
+                if hitT or pAge >= horizonBars
+                    float potT = array.get(pPotA, i)
+                    int bk = f_bucket(potT)
+                    array.set(stN, bk, array.get(stN, bk) + 1)
+                    array.set(stH, bk, array.get(stH, bk) + (hitT ? 1 : 0))
+                    array.set(stP, bk, array.get(stP, bk) + potT)
+                    array.remove(pLvl, i)
+                    array.remove(pDirA, i)
+                    array.remove(pStart, i)
+                    array.remove(pPotA, i)
+    if targetChanged and not na(fP) and fDir != 0 and not na(fLvl)
+        array.push(pLvl, fLvl)
+        array.push(pDirA, fDir)
+        array.push(pStart, bar_index)
+        array.push(pPotA, fP)
+        if array.size(pLvl) > 300
+            array.shift(pLvl)
+            array.shift(pDirA)
+            array.shift(pStart)
+            array.shift(pPotA)
+
+// ===================== PANEL MULTI-TEMPORALIDAD (sesgo + POT por temporalidad) =====================
+// Version compacta del motor por temporalidad: sesgo = HTF (EMA50) + Order Flow (proxy de delta) + BBR - Premium/Discount,
+// con los mismos pesos del POT. Objetivo = ultimo swing (liquidez) en la direccion del sesgo; POT = caminata aleatoria
+// hacia ese nivel ajustada en log-odds por el sesgo. No incluye FVG/OB/barridas (eso solo lo hace el target del grafico).
+f_tf() =>
+    float a = ta.atr(14)
+    float sig = nz(a) * 0.6
+    float e50 = ta.ema(close, 50)
+    float bias = close > e50 ? 1.0 : close < e50 ? -1.0 : 0.0
+    float phx = ta.pivothigh(high, 5, 5)
+    float plx = ta.pivotlow(low, 5, 5)
+    var float sh = na
+    var float sl = na
+    if not na(phx)
+        sh := phx
+    if not na(plx)
+        sl := plx
+    float dl = high > low ? volume * (2.0 * close - high - low) / (high - low) : 0.0
+    float vs = math.sum(volume, ofLen)
+    float fl = vs > 0 ? math.sum(dl, ofLen) / vs : 0.0
+    float ofs = math.max(-1.0, math.min(1.0, fl / 0.20))
+    float bu = math.sum(close > open ? high - low : 0.0, bbrLen)
+    float be = math.sum(close < open ? high - low : 0.0, bbrLen)
+    float bt = bu + be
+    float br = bt > 0 ? bu / bt : 0.5
+    float bsm = nz(ta.ema(br, bbrSmooth), 0.5)
+    float bs = math.max(-1.0, math.min(1.0, (bsm - 0.5) / 0.15))
+    bool rOk = not na(sh) and not na(sl) and sh > sl
+    float pd = rOk ? math.max(-1.0, math.min(1.0, (close - (sh + sl) / 2.0) / ((sh - sl) / 2.0))) : 0.0
+    float raw = wHtf * bias + wOf * ofs + wBbr * bs - wPd * pd
+    int d = raw > 0 ? 1 : raw < 0 ? -1 : 0
+    float tgt = d == 1 ? ((not na(sh) and sh > close) ? sh : close + 2.0 * nz(a)) : d == -1 ? ((not na(sl) and sl < close) ? sl : close - 2.0 * nz(a)) : na
+    float p = na
+    if d != 0 and not na(tgt) and sig > 0
+        float zs = math.abs(tgt - close) / (sig * math.sqrt(horizonBars))
+        float pb = math.max(0.001, math.min(0.999, 2.0 * (1.0 - f_ncdf(zs))))
+        float lg = math.log(pb / (1.0 - pb)) + math.abs(raw)
+        p := 1.0 / (1.0 + math.exp(-lg))
+    [d, p, tgt]
+
+float tfD1 = na
+float tfP1 = na
+float tfT1 = na
+float tfD15 = na
+float tfP15 = na
+float tfT15 = na
+float tfD60 = na
+float tfP60 = na
+float tfT60 = na
+float tfD240 = na
+float tfP240 = na
+float tfT240 = na
+if tfOn   // con el panel apagado no se pide ninguna temporalidad (ahorra tiempo de ejecucion)
+    [qD1, qP1, qT1] = request.security(syminfo.tickerid, "1", f_tf())
+    tfD1 := qD1
+    tfP1 := qP1
+    tfT1 := qT1
+    [qD15, qP15, qT15] = request.security(syminfo.tickerid, "15", f_tf())
+    tfD15 := qD15
+    tfP15 := qP15
+    tfT15 := qT15
+    [qD60, qP60, qT60] = request.security(syminfo.tickerid, "60", f_tf())
+    tfD60 := qD60
+    tfP60 := qP60
+    tfT60 := qT60
+    [qD240, qP240, qT240] = request.security(syminfo.tickerid, "240", f_tf())
+    tfD240 := qD240
+    tfP240 := qP240
+    tfT240 := qT240
+
+var table tfTbl = table.new(tfPosV, 4, 7, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+f_tfRow(r, nm, d, p, tgt) =>
+    color c = d == 1 ? color.new(color.lime, 0) : d == -1 ? color.new(color.red, 0) : color.new(color.silver, 0)
+    string dirTxt = d == 1 ? "▲ ALCISTA" : d == -1 ? "▼ BAJISTA" : "– neutral"
+    string pTxt = na(p) ? "-" : str.tostring(math.round(p * 100.0)) + "%" + (p * 100.0 >= minPotShow ? " ✔" : "")
+    table.cell(tfTbl, 0, r, nm, text_color=color.new(color.white, 20), text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 1, r, dirTxt, text_color=c, text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 2, r, pTxt, text_color=c, text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 3, r, na(tgt) ? "-" : str.tostring(tgt, format.mintick), text_color=color.new(color.white, 20), text_halign=text.align_left, text_size=size.small)
+
+if barstate.islast and tfOn
+    table.cell(tfTbl, 0, 0, "TF", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 1, 0, "Sesgo", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 2, 0, "POT", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 3, 0, "Objetivo", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    f_tfRow(1, "Grafico " + timeframe.period, fDir, na(pShown) ? na : pShown, fLvl)
+    f_tfRow(2, "1 min", tfD1, tfP1, tfT1)
+    f_tfRow(3, "15 min", tfD15, tfP15, tfT15)
+    f_tfRow(4, "1 hora", tfD60, tfP60, tfT60)
+    f_tfRow(5, "4 horas", tfD240, tfP240, tfT240)
+    int tfBull = (tfD1 == 1 ? 1 : 0) + (tfD15 == 1 ? 1 : 0) + (tfD60 == 1 ? 1 : 0) + (tfD240 == 1 ? 1 : 0)
+    int tfBear = (tfD1 == -1 ? 1 : 0) + (tfD15 == -1 ? 1 : 0) + (tfD60 == -1 ? 1 : 0) + (tfD240 == -1 ? 1 : 0)
+    int tfAgree = fDir == 1 ? tfBull : fDir == -1 ? tfBear : 0
+    string tfConf = fDir == 0 ? str.tostring(tfBull) + "▲ / " + str.tostring(tfBear) + "▼" : str.tostring(tfAgree) + "/4 a favor del target"
+    color tfConfCol = fDir == 0 ? color.new(color.silver, 0) : tfAgree >= 3 ? color.new(color.lime, 0) : tfAgree <= 1 ? color.new(color.red, 0) : color.new(color.yellow, 0)
+    table.cell(tfTbl, 0, 6, "Confluencia", text_color=color.new(color.white, 20), text_halign=text.align_left, text_size=size.small)
+    table.cell(tfTbl, 1, 6, tfConf, text_color=tfConfCol, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(tfTbl, 1, 6, 3, 6)
+
+// Visibilidad del target segun umbral de POT (con histeresis de 5 puntos)
+var bool potVis = false
+if na(pShown)
+    potVis := false
+else if pShown * 100.0 >= minPotShow
+    potVis := true
+else if pShown * 100.0 < minPotShow - 5
+    potVis := false
+
+// ===================== DRAW =====================
+var box tBox = na
+var label tLbl = na
+var table pnl = na
+if barstate.islast
+    f_clearDrawings()
+    int xR = bar_index + 12      // borde derecho: 12 velas al futuro
+
+    // Resumen del contador de aciertos
+    int stNt = array.get(stN, 0) + array.get(stN, 1) + array.get(stN, 2)
+    int stHt = array.get(stH, 0) + array.get(stH, 1) + array.get(stH, 2)
+    float stPt = array.get(stP, 0) + array.get(stP, 1) + array.get(stP, 2)
+    string accTxt = stNt == 0 ? "sin datos" : str.tostring(math.round(100.0 * stHt / stNt)) + "% (n=" + str.tostring(stNt) + ") · POT medio " + str.tostring(math.round(100.0 * stPt / stNt)) + "%"
+
+    [bslPx, bslStr, bslTm, bslTag] = f_nearLiq(1)
+    [sslPx, sslStr, sslTm, sslTag] = f_nearLiq(-1)
+    [beFvgLv, beFvgTag] = f_nearFvg(-1)
+    [bFvgLv, bFvgTag] = f_nearFvg(1)
+    int iBeOb = f_nearOb(-1)
+    int iBOb = f_nearOb(1)
+    int iBbB = f_nearBrk(1)
+    int iBbR = f_nearBrk(-1)
+
+    // ---- Target (BFVG / BeFVG / iBFVG / iBeFVG) ----
+    int dI = tgtId != -1 ? array.indexof(zId, tgtId) : -1
+    if dI != -1 and not na(pShown) and fDir != 0 and (potVis or minPotShow == 0)
+        float dTop = array.get(zTop, dI)
+        float dBot = array.get(zBot, dI)
+        int dTime = math.max(array.get(zBorn, dI), bMin)   // FIX
+        int tDir = array.get(zDir, dI)
+        color col = fDir == 1 ? bullColor : bearColor
+        string typTxt = (array.get(zInv, dI) ? "i" : "") + (tDir == 1 ? "BFVG" : "BeFVG")
+        string arrTxt = fDir == 1 ? "▲" : "▼"
+        int pPct = math.round(pShown * 100.0)
+        float dP = (bar_index - tgtSince >= 5 and not na(pShown5)) ? (pShown - pShown5) * 100.0 : na
+        string dTxt = na(dP) ? "" : (dP >= 1.0 ? "  ▲+" + str.tostring(math.round(dP)) + "%" : dP <= -1.0 ? "  ▼" + str.tostring(math.round(dP)) + "%" : "  =")
+        string newTxt = bar_index - tgtSince <= 10 ? "  ↻ cambió" : ""
+        string mssTag = ""
+        if mssBar >= 0 and bar_index - mssBar <= sweepMem
+            mssTag := mssDir == fDir ? "MSS✔ " : "MSS✖ "
+        string why = f_tag("DOL", fDol) + mssTag + f_tag("BBR", fBbr) + f_tag("OF", fOf) + f_tag("OB", fOb) + f_tag("FVG", fFvg) + f_tag("HTF", fHtf)
+        string txt = "TARGET " + typTxt + " " + arrTxt + " " + str.tostring(fLvl, format.mintick) + "\nPOT " + str.tostring(pPct) + "%" + dTxt + "  · " + str.tostring(horizonBars) + " velas" + newTxt + "\nBBR " + str.tostring(math.round(bbrSm * 100.0)) + "% bull" + (why == "" ? "" : "\n" + why)
+        string tip = ""
+        if showTip
+            tip := "POT base (caminata aleatoria): " + str.tostring(math.round(fPb * 100.0)) + "%\n" + "DOL (BSL/SSL + FVG): " + str.tostring(fDol, "0.00") + "\n" + "Order Flow (delta): " + str.tostring(fOf, "0.00") + "\n" + "Order Block (BOB/BeOB): " + str.tostring(fOb, "0.00") + "\n" + "Premium/Discount: " + str.tostring(fPd, "0.00") + "\n" + "HTF: " + str.tostring(fHtf, "0.00") + "\n" + "FVG ctx: " + str.tostring(fFvg, "0.00") + "\n" + "BBR: " + str.tostring(fBbr, "0.00") + "\n" + "Acierto real: " + accTxt
+        float midY = (dTop + dBot) / 2.0
+        if na(tBox)
+            tBox := box.new(dTime, dTop, xR, dBot, border_color=col, border_width=1, bgcolor=color.new(col, 85))
+        else
+            box.set_lefttop(tBox, dTime, dTop)
+            box.set_rightbottom(tBox, xR, dBot)
+            box.set_border_color(tBox, col)
+            box.set_bgcolor(tBox, color.new(col, 85))
+        if na(tLbl)
+            tLbl := label.new(xR, midY, txt, style=label.style_label_left, color=col, textcolor=color.white, size=f_size(labelSize), tooltip=tip)
+        else
+            label.set_xy(tLbl, xR, midY)
+            label.set_text(tLbl, txt)
+            label.set_color(tLbl, col)
+            label.set_tooltip(tLbl, tip)
+    else
+        if not na(tBox)
+            box.delete(tBox)
+            tBox := na
+        if not na(tLbl)
+            label.delete(tLbl)
+            tLbl := na
+
+    // ---- Todos los BFVG / BeFVG rastreados (opcional) ----
+    if showAllFvg
+        int nZd = array.size(zTop)
+        if nZd > 0
+            for k = 0 to nZd - 1
+                if not array.get(zHit, k) and array.get(zId, k) != tgtId
+                    int kdr = array.get(zDir, k)
+                    color kcol = kdr == -1 ? bullColor : bearColor
+                    string ktxt = (array.get(zInv, k) ? "i" : "") + (kdr == 1 ? "BFVG" : "BeFVG")
+                    array.push(xBox, box.new(math.max(array.get(zBorn, k), bMin), array.get(zTop, k), xR, array.get(zBot, k), border_color=color.new(kcol, 40), border_width=1, bgcolor=color.new(kcol, 92), text=ktxt, text_size=size.tiny, text_color=kcol, text_halign=text.align_right))
+
+    // ---- BSL / SSL mas cercanos ----
+    if showLiq
+        if not na(bslPx)
+            array.push(xLin, line.new(math.max(bslTm, bMin), bslPx, xR, bslPx, color=bslColor, style=line.style_dashed, width=bslStr >= 2 ? 2 : 1))
+            array.push(xLbl, label.new(xR, bslPx, bslTag + " " + str.tostring(bslPx, format.mintick), style=label.style_label_left, color=color.new(bslColor, 100), textcolor=bslColor, size=size.small))
+        if not na(sslPx)
+            array.push(xLin, line.new(math.max(sslTm, bMin), sslPx, xR, sslPx, color=sslColor, style=line.style_dashed, width=sslStr >= 2 ? 2 : 1))
+            array.push(xLbl, label.new(xR, sslPx, sslTag + " " + str.tostring(sslPx, format.mintick), style=label.style_label_left, color=color.new(sslColor, 100), textcolor=sslColor, size=size.small))
+
+    // ---- BeOB / BOB mas cercanos (con linea del 50% = mean threshold) ----
+    if showObZones
+        if iBeOb != -1
+            f_drawOb(iBeOb, beObColor, "BeOB", xR)
+        if iBOb != -1
+            f_drawOb(iBOb, bObColor, "BOB", xR)
+
+    // ---- Breaker blocks (BB) mas cercanos; Unicorn = breaker + FVG del mismo sentido ----
+    if showBrk
+        if iBbB != -1 and iBbB != iBOb
+            f_drawOb(iBbB, bObColor, f_unicorn(iBbB) ? "BB+ Unicorn" : "BB+", xR)
+        if iBbR != -1 and iBbR != iBeOb
+            f_drawOb(iBbR, beObColor, f_unicorn(iBbR) ? "BB- Unicorn" : "BB-", xR)
+
+    // ---- Panel de contexto ----
+    if showPanel
+        if na(pnl)
+            pnl := table.new(panelPos == "Top Left" ? position.top_left : panelPos == "Top Right" ? position.top_right : panelPos == "Bottom Left" ? position.bottom_left : position.bottom_right, 2, showStats ? 15 : 13, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+        color bbrCol = bbrSm > 0.55 ? color.new(color.lime, 0) : bbrSm < 0.45 ? color.new(color.red, 0) : color.new(color.silver, 0)
+        int bullPct = math.round(bbrSm * 100.0)
+        string swTxt = "-"
+        if sweepBar >= 0
+            swTxt := (sweepTag != "" ? sweepTag : (sweepSig == 1 ? "SSL" : "BSL")) + " barrida " + (sweepSig == 1 ? "▲" : "▼") + " · hace " + str.tostring(bar_index - sweepBar) + " velas"
+        string mssTxt = "-"
+        color mssCol = color.new(color.silver, 0)
+        if mssState == 1
+            mssTxt := "esperando MSS " + (sweepSig == 1 ? "▲" : "▼") + " (" + str.tostring(math.max(0, mssWindow - (bar_index - mssArm))) + " velas)"
+            mssCol := color.new(color.yellow, 0)
+        else if mssState == 2
+            mssTxt := "MSS " + (mssDir == 1 ? "▲ alcista" : "▼ bajista") + " · hace " + str.tostring(bar_index - mssBar) + " velas"
+            mssCol := mssDir == 1 ? color.new(color.lime, 0) : color.new(color.red, 0)
+        else if mssState == 3
+            mssTxt := "barrida sin MSS"
+        table.cell(pnl, 0, 0, "Trading DOL 1.0", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+        table.cell(pnl, 1, 0, modeInput + " · " + str.tostring(horizonBars) + " velas", text_color=color.new(color.white, 20), text_halign=text.align_left, text_size=size.small)
+        f_row(pnl, 1, "BBR bull/bear", str.tostring(bullPct) + "% / " + str.tostring(100 - bullPct) + "%  (media " + str.tostring(math.round(bbrAvg * 100.0)) + "%)", bbrCol)
+        f_row(pnl, 2, "BSL ▲", na(bslPx) ? "-" : bslTag + " " + f_distTxt(bslPx), bslColor)
+        f_row(pnl, 3, "SSL ▼", na(sslPx) ? "-" : sslTag + " " + f_distTxt(sslPx), sslColor)
+        f_row(pnl, 4, "BeFVG ▲", na(beFvgLv) ? "-" : beFvgTag + " " + f_distTxt(beFvgLv), bullColor)
+        f_row(pnl, 5, "BFVG ▼", na(bFvgLv) ? "-" : bFvgTag + " " + f_distTxt(bFvgLv), bearColor)
+        f_row(pnl, 6, "BeOB ▲", iBeOb == -1 ? "-" : str.tostring(array.get(oBot, iBeOb), format.mintick) + " - " + str.tostring(array.get(oTop, iBeOb), format.mintick) + (array.get(oBrk, iBeOb) ? " brk" : ""), beObColor)
+        f_row(pnl, 7, "BOB ▼", iBOb == -1 ? "-" : str.tostring(array.get(oBot, iBOb), format.mintick) + " - " + str.tostring(array.get(oTop, iBOb), format.mintick) + (array.get(oBrk, iBOb) ? " brk" : ""), bObColor)
+        f_row(pnl, 8, "Ultima barrida", swTxt, color.new(color.white, 0))
+        f_row(pnl, 9, "Estructura MSS", mssTxt, mssCol)
+        f_row(pnl, 10, "BB ▲ (alcista)", iBbB == -1 ? "-" : str.tostring(array.get(oBot, iBbB), format.mintick) + " - " + str.tostring(array.get(oTop, iBbB), format.mintick) + (f_unicorn(iBbB) ? "  UNICORN" : ""), bObColor)
+        f_row(pnl, 11, "BB ▼ (bajista)", iBbR == -1 ? "-" : str.tostring(array.get(oBot, iBbR), format.mintick) + " - " + str.tostring(array.get(oTop, iBbR), format.mintick) + (f_unicorn(iBbR) ? "  UNICORN" : ""), beObColor)
+        f_row(pnl, 12, "BOS / MSS", stEvBar < 0 ? "-" : stEvTxt + " · hace " + str.tostring(bar_index - stEvBar) + " velas", stEvBar < 0 ? color.new(color.silver, 0) : stEvDir == 1 ? color.new(color.lime, 0) : color.new(color.red, 0))
+        if showStats
+            // verde = POT calibrado (hit-rate ~ POT medio), rojo = POT sobreestima, naranja = POT subestima (con n >= 20)
+            color accCol = color.new(color.silver, 0)
+            if stNt >= 20
+                float accDif = (stHt - stPt) / stNt
+                accCol := math.abs(accDif) <= 0.07 ? color.new(color.lime, 0) : accDif < 0 ? color.new(color.red, 0) : color.new(color.orange, 0)
+            f_row(pnl, 13, "Acierto POT", accTxt, accCol)
+            f_row(pnl, 14, "Tramos <50/50-70/≥70", f_bkTxt(0) + " / " + f_bkTxt(1) + " / " + f_bkTxt(2), color.new(color.white, 0))
+
+// =====================================================================
+//  MODULO 2: PERFIL DE VOLUMEN - COMPRAS (verde) vs VENTAS (rojo)
+//  Independiente del modulo DOL: estado, dibujos y tabla propios (prefijo "vp").
+//  Reparto compra/venta: con "vpUseDelta" usa el delta de cada vela
+//  (compra = (vol + delta)/2, venta = (vol - delta)/2); si no, cierre >= apertura = compra.
+//  El volumen de cada vela se reparte proporcionalmente entre las filas que toca.
+// =====================================================================
+var array<box>   vpBoxes  = array.new<box>()
+var array<line>  vpLines  = array.new<line>()
+var array<label> vpLabels = array.new<label>()
+var table vpTbl = table.new(vpPosV, 2, 5, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+if barstate.islast
+    // Limpiar solo los objetos del VP (los del DOL no se tocan)
+    for vb in vpBoxes
+        box.delete(vb)
+    array.clear(vpBoxes)
+    for vl in vpLines
+        line.delete(vl)
+    array.clear(vpLines)
+    for vt in vpLabels
+        label.delete(vt)
+    array.clear(vpLabels)
+
+    int vpN = math.min(vpLookback, bar_index + 1)
+    float vpHi = high
+    float vpLo = low
+    if vpOn
+        for i = 0 to vpN - 1
+            vpHi := math.max(vpHi, high[i])
+            vpLo := math.min(vpLo, low[i])
+
+    float vpStep = (vpHi - vpLo) / vpRows
+
+    if vpOn and vpStep > 0
+        array<float> vpUp = array.new<float>(vpRows, 0.0)
+        array<float> vpDn = array.new<float>(vpRows, 0.0)
+
+        // Repartir el volumen de cada vela entre las filas que toca
+        for i = 0 to vpN - 1
+            float bh = high[i]
+            float bl = low[i]
+            float bv = nz(volume[i])
+            bool isUp = close[i] >= open[i]
+            // Compra / venta de la vela: por delta (compra = (vol + delta)/2) o por color de la vela
+            float bvBuy = vpUseDelta ? math.max(0.0, math.min(bv, (bv + nz(barDelta[i])) / 2.0)) : (isUp ? bv : 0.0)
+            float bvSell = bv - bvBuy
+            float rng = bh - bl
+            int idxLo = math.max(0, math.min(vpRows - 1, int(math.floor((bl - vpLo) / vpStep))))
+            int idxHi = math.max(0, math.min(vpRows - 1, int(math.floor((bh - vpLo) / vpStep))))
+            for r = idxLo to idxHi
+                float rowLo = vpLo + r * vpStep
+                float rowHi = rowLo + vpStep
+                float overlap = math.min(bh, rowHi) - math.max(bl, rowLo)
+                float portion = rng > 0 ? math.max(overlap, 0.0) / rng : 1.0 / (idxHi - idxLo + 1)
+                vpUp.set(r, vpUp.get(r) + bvBuy * portion)
+                vpDn.set(r, vpDn.get(r) + bvSell * portion)
+
+        // Totales, POC y volumen total
+        array<float> vpTot = array.new<float>(vpRows, 0.0)
+        float vpMax = 0.0
+        float vpSum = 0.0
+        float vpSumUp = 0.0
+        float vpSumDn = 0.0
+        int vpPoc = 0
+        for r = 0 to vpRows - 1
+            float t = vpUp.get(r) + vpDn.get(r)
+            vpTot.set(r, t)
+            vpSum += t
+            vpSumUp += vpUp.get(r)
+            vpSumDn += vpDn.get(r)
+            if t > vpMax
+                vpMax := t
+                vpPoc := r
+
+        if vpMax > 0
+            // Area de valor: se expande desde el POC hacia la fila vecina con mas volumen
+            float vpRem = vpSum * vpVaPct - vpTot.get(vpPoc)
+            int vaHiI = vpPoc
+            int vaLoI = vpPoc
+            while vpRem > 0
+                float nUp = vaHiI + 1 < vpRows ? vpTot.get(vaHiI + 1) : -1.0
+                float nDn = vaLoI - 1 >= 0 ? vpTot.get(vaLoI - 1) : -1.0
+                if nUp < 0 and nDn < 0
+                    break
+                bool goUp = nUp >= nDn
+                float cand = goUp ? nUp : nDn
+                if cand > vpRem
+                    break
+                vpRem -= cand
+                if goUp
+                    vaHiI += 1
+                else
+                    vaLoI -= 1
+
+            int vpX0 = vpPlace == "Derecha del precio" ? bar_index + vpGap : bar_index - vpN + 1
+            int vpZL = bar_index - vpN + 1
+            int vpZR = bar_index
+            int vpXE = bar_index + vpGap + vpProfW
+
+            // 1) Zonas sombreadas: verde = dominan compras, rojo = dominan ventas
+            if vpShowZones
+                for r = 0 to vpRows - 1
+                    if vpTot.get(r) >= vpHvnPct * vpMax
+                        float zLo = vpLo + r * vpStep
+                        float zHi = zLo + vpStep
+                        color zc = vpUp.get(r) >= vpDn.get(r) ? vpZoneBuy : vpZoneSell
+                        vpBoxes.push(box.new(vpZL, zHi, vpZR, zLo, border_color=na, bgcolor=zc))
+
+            // 2) Histograma: tramo de compra (verde) + tramo de venta (rojo)
+            for r = 0 to vpRows - 1
+                float rLo = vpLo + r * vpStep
+                float rHi = rLo + vpStep
+                bool inVA = r >= vaLoI and r <= vaHiI
+                int uW = int(math.round(vpUp.get(r) / vpMax * vpProfW))
+                int dW = int(math.round(vpDn.get(r) / vpMax * vpProfW))
+                if uW > 0
+                    vpBoxes.push(box.new(vpX0, rHi, vpX0 + uW, rLo, border_color=na, bgcolor=inVA ? vpVaBuyCol : vpBuyCol))
+                if dW > 0
+                    vpBoxes.push(box.new(vpX0 + uW, rHi, vpX0 + uW + dW, rLo, border_color=na, bgcolor=inVA ? vpVaSellCol : vpSellCol))
+
+            // 3) POC, VAH, VAL
+            float pocPx = vpLo + (vpPoc + 0.5) * vpStep
+            float vahPx = vpLo + (vaHiI + 1) * vpStep
+            float valPx = vpLo + vaLoI * vpStep
+            if vpShowPoc
+                vpLines.push(line.new(vpZL, pocPx, vpXE, pocPx, color=vpPocCol, width=2))
+                vpLabels.push(label.new(vpXE, pocPx, "POC " + str.tostring(pocPx, format.mintick), style=label.style_label_left, color=color.new(vpPocCol, 100), textcolor=vpPocCol, size=size.small))
+            if vpShowVa
+                vpLines.push(line.new(vpZL, vahPx, vpXE, vahPx, color=vpVaCol, width=1, style=line.style_dashed))
+                vpLines.push(line.new(vpZL, valPx, vpXE, valPx, color=vpVaCol, width=1, style=line.style_dashed))
+                vpLabels.push(label.new(vpXE, vahPx, "VAH " + str.tostring(vahPx, format.mintick), style=label.style_label_left, color=color.new(vpVaCol, 100), textcolor=vpVaCol, size=size.small))
+                vpLabels.push(label.new(vpXE, valPx, "VAL " + str.tostring(valPx, format.mintick), style=label.style_label_left, color=color.new(vpVaCol, 100), textcolor=vpVaCol, size=size.small))
+
+            // 4) Tabla de resumen VP (reutiliza f_row, solo para dar formato)
+            if vpShowTbl
+                float buyPct = vpSumUp / vpSum * 100.0
+                float sellPct = vpSumDn / vpSum * 100.0
+                bool buyBias = buyPct >= sellPct
+                f_row(vpTbl, 0, "VP Compras", str.tostring(buyPct, "#.0") + "%", color.green)
+                f_row(vpTbl, 1, "VP Ventas", str.tostring(sellPct, "#.0") + "%", color.red)
+                f_row(vpTbl, 2, "VP Sesgo", buyBias ? "COMPRADOR" : "VENDEDOR", buyBias ? color.green : color.red)
+                f_row(vpTbl, 3, "Precio vs POC", close >= pocPx ? "Encima" : "Debajo", close >= pocPx ? color.green : color.red)
+                f_row(vpTbl, 4, "Precio vs VA", close > vahPx ? "Sobre VAH" : close < valPx ? "Bajo VAL" : "Dentro", color.white)
+
+// =====================================================================
+//  MODULO 3: ORDER FLOW
+//  Estado propio (prefijo "ofl"). Solo LEE barDelta del modulo DOL
+//  (delta intrabar; si no hay datos intrabar usa el proxy del DOL).
+//   - Delta extremo: delta de la vela > N desviaciones, a favor de la vela.
+//   - Absorcion: delta extremo en contra y la vela cierra en sentido contrario
+//     (agresores absorbidos por ordenes pasivas) -> posible giro.
+//   - Divergencia (ventana): precio hace nuevo extremo y el CVD no lo confirma.
+//   - Divergencia (pivotes): pivote de precio mas alto/bajo sin confirmacion del CVD.
+//   - Delta %: delta / volumen. <5% balance, >=10% iniciativa.
+//   - Delta flip: el delta cambia de signo con delta% significativo.
+//   - Rechazo: el delta intravela llego lejos (max/min) y la vela cerro lejos de ese extremo.
+//   - Agotamiento: delta extremo seguido de vela de giro con delta contrario.
+//  Los eventos alimentan oflEvBias, que se mezcla en el score de Order Flow del POT.
+// =====================================================================
+var string oflLastTxt = "-"
+var int    oflLastBar = -1
+var table  oflTbl = table.new(oflPosV, 2, 8, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+var float  oflLPhPx = na
+var float  oflLPhCv = na
+var float  oflLPlPx = na
+var float  oflLPlCv = na
+
+float oflDelta = nz(barDelta)
+float oflCvd   = ta.cum(oflDelta)
+float oflSd    = ta.stdev(oflDelta, oflStdLen)
+float oflPxHi  = ta.highest(high, oflDivLen)
+float oflPxLo  = ta.lowest(low, oflDivLen)
+float oflCvHi  = ta.highest(oflCvd, oflDivLen)
+float oflCvLo  = ta.lowest(oflCvd, oflDivLen)
+float oflMidP  = (high + low) / 2.0
+float oflPct   = volume > 0 ? oflDelta / volume * 100.0 : 0.0
+float oflPh    = ta.pivothigh(high, oflPvLen, oflPvLen)
+float oflPl    = ta.pivotlow(low, oflPvLen, oflPvLen)
+
+bool oflImbBuy  = oflOn and oflSd > 0 and oflDelta > oflImbMult * oflSd and close > open
+bool oflImbSell = oflOn and oflSd > 0 and oflDelta < -oflImbMult * oflSd and close < open
+bool oflAbsBuy  = oflOn and oflSd > 0 and oflDelta < -oflImbMult * oflSd and close >= open and close > oflMidP
+bool oflAbsSell = oflOn and oflSd > 0 and oflDelta > oflImbMult * oflSd and close <= open and close < oflMidP
+bool oflDivBearRaw = oflOn and bar_index > oflDivLen and high > oflPxHi[1] and oflCvd < oflCvHi[1]
+bool oflDivBullRaw = oflOn and bar_index > oflDivLen and low < oflPxLo[1] and oflCvd > oflCvLo[1]
+
+// Delta flip: cambio de signo con delta% significativo (la vela previa tambien debe salir del balance)
+float oflPctPrev = nz(oflPct[1])
+bool oflFlipBuy  = oflOn and oflDelta > 0 and nz(oflDelta[1]) < 0 and oflPct >= oflPctInit and oflPctPrev <= -oflPctBal
+bool oflFlipSell = oflOn and oflDelta < 0 and nz(oflDelta[1]) > 0 and oflPct <= -oflPctInit and oflPctPrev >= oflPctBal
+
+// Rechazo: el delta intravela llego a un extremo y la vela cerro lejos de el (solo con datos intrabar)
+bool oflFadeUp = oflOn and oflSd > 0 and dMax > oflImbMult * oflSd and oflDelta < oflFadeRatio * dMax
+bool oflFadeDn = oflOn and oflSd > 0 and dMin < -oflImbMult * oflSd and oflDelta > oflFadeRatio * dMin
+
+// Agotamiento: delta extremo en la vela previa y vela de giro con delta contrario
+bool oflExhBuy  = oflOn and oflImbBuy[1] and close < open and oflDelta < 0
+bool oflExhSell = oflOn and oflImbSell[1] and close > open and oflDelta > 0
+
+bool oflEvImbBuy  = barstate.isconfirmed and oflImbBuy
+bool oflEvImbSell = barstate.isconfirmed and oflImbSell
+bool oflEvAbsBuy  = barstate.isconfirmed and oflAbsBuy
+bool oflEvAbsSell = barstate.isconfirmed and oflAbsSell
+bool oflEvDivBear = barstate.isconfirmed and oflDivBearRaw and not oflDivBearRaw[1]
+bool oflEvDivBull = barstate.isconfirmed and oflDivBullRaw and not oflDivBullRaw[1]
+bool oflEvFlipBuy  = barstate.isconfirmed and oflFlipBuy
+bool oflEvFlipSell = barstate.isconfirmed and oflFlipSell
+bool oflEvFadeUp   = barstate.isconfirmed and oflFadeUp and not oflAbsSell
+bool oflEvFadeDn   = barstate.isconfirmed and oflFadeDn and not oflAbsBuy
+bool oflEvExhBuy   = barstate.isconfirmed and oflExhBuy
+bool oflEvExhSell  = barstate.isconfirmed and oflExhSell
+
+// Divergencia CVD por pivotes: se confirma oflPvLen velas despues del pivote (el marcador se dibuja sobre el pivote)
+bool oflEvPDivBear = false
+bool oflEvPDivBull = false
+if barstate.isconfirmed and oflOn and not na(oflPh)
+    float cvAtH = oflCvd[oflPvLen]
+    if not na(oflLPhPx) and oflPh > oflLPhPx and cvAtH < oflLPhCv
+        oflEvPDivBear := true
+    oflLPhPx := oflPh
+    oflLPhCv := cvAtH
+if barstate.isconfirmed and oflOn and not na(oflPl)
+    float cvAtL = oflCvd[oflPvLen]
+    if not na(oflLPlPx) and oflPl < oflLPlPx and cvAtL > oflLPlCv
+        oflEvPDivBull := true
+    oflLPlPx := oflPl
+    oflLPlCv := cvAtL
+
+if oflEvPDivBear
+    oflLastTxt := "Divergencia CVD pivotes bajista ◆"
+    oflLastBar := bar_index
+else if oflEvPDivBull
+    oflLastTxt := "Divergencia CVD pivotes alcista ◆"
+    oflLastBar := bar_index
+else if oflEvDivBear
+    oflLastTxt := "Divergencia bajista ◆"
+    oflLastBar := bar_index
+else if oflEvDivBull
+    oflLastTxt := "Divergencia alcista ◆"
+    oflLastBar := bar_index
+else if oflEvAbsBuy
+    oflLastTxt := "Absorcion alcista ●"
+    oflLastBar := bar_index
+else if oflEvAbsSell
+    oflLastTxt := "Absorcion bajista ●"
+    oflLastBar := bar_index
+else if oflEvExhBuy
+    oflLastTxt := "Agotamiento comprador ✖"
+    oflLastBar := bar_index
+else if oflEvExhSell
+    oflLastTxt := "Agotamiento vendedor ✖"
+    oflLastBar := bar_index
+else if oflEvFadeUp
+    oflLastTxt := "Rechazo de compradores (delta max)"
+    oflLastBar := bar_index
+else if oflEvFadeDn
+    oflLastTxt := "Rechazo de vendedores (delta min)"
+    oflLastBar := bar_index
+else if oflEvImbBuy
+    oflLastTxt := "Delta compra extremo ▲"
+    oflLastBar := bar_index
+else if oflEvImbSell
+    oflLastTxt := "Delta venta extremo ▼"
+    oflLastBar := bar_index
+else if oflEvFlipBuy
+    oflLastTxt := "Delta flip a compra"
+    oflLastBar := bar_index
+else if oflEvFlipSell
+    oflLastTxt := "Delta flip a venta"
+    oflLastBar := bar_index
+
+// Sesgo por eventos para el POT: absorcion/divergencia/rechazo/agotamiento/flip (decae 10% por vela)
+oflEvBias := math.max(-1.0, math.min(1.0, oflEvBias * 0.9 + (oflEvAbsBuy ? 0.6 : 0.0) - (oflEvAbsSell ? 0.6 : 0.0) + (oflEvDivBull ? 0.4 : 0.0) - (oflEvDivBear ? 0.4 : 0.0) + (oflEvPDivBull ? 0.5 : 0.0) - (oflEvPDivBear ? 0.5 : 0.0) + (oflEvFlipBuy ? 0.3 : 0.0) - (oflEvFlipSell ? 0.3 : 0.0) + (oflEvFadeDn ? 0.4 : 0.0) - (oflEvFadeUp ? 0.4 : 0.0) - (oflEvExhBuy ? 0.5 : 0.0) + (oflEvExhSell ? 0.5 : 0.0)))
+
+plotshape(oflShowImb and oflEvImbBuy, title="OF: Delta compra extremo", style=shape.triangleup, location=location.belowbar, color=oflBuyCol, size=size.tiny)
+plotshape(oflShowImb and oflEvImbSell, title="OF: Delta venta extremo", style=shape.triangledown, location=location.abovebar, color=oflSellCol, size=size.tiny)
+plotshape(oflShowAbs and oflEvAbsBuy, title="OF: Absorcion alcista", style=shape.circle, location=location.belowbar, color=oflBuyCol, size=size.tiny, text="Abs", textcolor=oflBuyCol)
+plotshape(oflShowAbs and oflEvAbsSell, title="OF: Absorcion bajista", style=shape.circle, location=location.abovebar, color=oflSellCol, size=size.tiny, text="Abs", textcolor=oflSellCol)
+plotshape(oflShowDiv and oflEvDivBull, title="OF: Divergencia alcista", style=shape.diamond, location=location.belowbar, color=oflBuyCol, size=size.tiny, text="Div", textcolor=oflBuyCol)
+plotshape(oflShowDiv and oflEvDivBear, title="OF: Divergencia bajista", style=shape.diamond, location=location.abovebar, color=oflSellCol, size=size.tiny, text="Div", textcolor=oflSellCol)
+plotshape(oflShowDiv and oflEvPDivBull, title="OF: Divergencia CVD pivotes alcista", style=shape.diamond, location=location.belowbar, color=oflBuyCol, size=size.small, offset=-oflPvLen)
+plotshape(oflShowDiv and oflEvPDivBear, title="OF: Divergencia CVD pivotes bajista", style=shape.diamond, location=location.abovebar, color=oflSellCol, size=size.small, offset=-oflPvLen)
+plotshape(oflShowNew and oflEvFlipBuy, title="OF: Delta flip a compra", style=shape.labelup, location=location.belowbar, color=oflBuyCol, size=size.tiny)
+plotshape(oflShowNew and oflEvFlipSell, title="OF: Delta flip a venta", style=shape.labeldown, location=location.abovebar, color=oflSellCol, size=size.tiny)
+plotshape(oflShowNew and oflEvFadeDn, title="OF: Rechazo de vendedores", style=shape.triangleup, location=location.belowbar, color=oflBuyCol, size=size.tiny)
+plotshape(oflShowNew and oflEvFadeUp, title="OF: Rechazo de compradores", style=shape.triangledown, location=location.abovebar, color=oflSellCol, size=size.tiny)
+plotshape(oflShowNew and oflEvExhSell, title="OF: Agotamiento vendedor", style=shape.xcross, location=location.belowbar, color=oflBuyCol, size=size.tiny)
+plotshape(oflShowNew and oflEvExhBuy, title="OF: Agotamiento comprador", style=shape.xcross, location=location.abovebar, color=oflSellCol, size=size.tiny)
+
+if barstate.islast and oflOn and oflShowTbl
+    string oflSrc = array.size(ltV) > 1 ? "intrabar " + ltf : "proxy (sin datos intrabar)"
+    string oflPres = ofScore >= 0.7 ? "COMPRADORA fuerte" : ofScore >= 0.3 ? "Compradora" : ofScore <= -0.7 ? "VENDEDORA fuerte" : ofScore <= -0.3 ? "Vendedora" : "Neutral"
+    color oflPresCol = ofScore >= 0.3 ? color.lime : ofScore <= -0.3 ? color.red : color.silver
+    string oflPctCls = math.abs(oflPct) < oflPctBal ? "balance" : math.abs(oflPct) < oflPctInit ? "zona gris" : (oflPct > 0 ? "iniciativa compra" : "iniciativa venta")
+    f_row(oflTbl, 0, "Order Flow", oflSrc, color.white)
+    f_row(oflTbl, 1, "Delta vela", str.tostring(oflDelta, format.volume), oflDelta >= 0 ? color.lime : color.red)
+    f_row(oflTbl, 2, "Delta " + str.tostring(ofLen) + " velas", str.tostring(dSum, format.volume) + " (" + str.tostring(flow * 100.0, "0.0") + "%)", dSum >= 0 ? color.lime : color.red)
+    f_row(oflTbl, 3, "CVD", str.tostring(oflCvd, format.volume) + (oflCvd > nz(oflCvd[ofLen]) ? "  ↑" : "  ↓"), oflCvd > nz(oflCvd[ofLen]) ? color.lime : color.red)
+    f_row(oflTbl, 4, "Presion", oflPres, oflPresCol)
+    f_row(oflTbl, 5, "Ultimo evento", oflLastBar < 0 ? "-" : oflLastTxt + " · hace " + str.tostring(bar_index - oflLastBar) + " velas", color.white)
+    f_row(oflTbl, 6, "Delta %", str.tostring(oflPct, "0.0") + "% · " + oflPctCls, math.abs(oflPct) < oflPctBal ? color.silver : oflPct > 0 ? color.lime : color.red)
+    f_row(oflTbl, 7, "Max / Min delta", str.tostring(dMax, format.volume) + " / " + str.tostring(dMin, format.volume), color.white)
+
+// =====================================================================
+//  MODULO 4: ORDER BLOCKS
+//  Estado propio (prefijo "blk"). Deteccion independiente de los OB del DOL.
+//   OB alcista = ultima vela bajista antes de la ruptura alcista de estructura
+//   OB bajista = ultima vela alcista antes de la ruptura bajista de estructura
+//  Se invalida segun el modo elegido; cada entrada del precio cuenta como test.
+// =====================================================================
+var float[] blkTop  = array.new_float(0)
+var float[] blkBot  = array.new_float(0)
+var int[]   blkDir  = array.new_int(0)
+var int[]   blkBorn = array.new_int(0)
+var int[]   blkTest = array.new_int(0)
+var float[] blkVr   = array.new_float(0)
+var float[] blkDl   = array.new_float(0)
+var float blkPH = na
+var float blkPL = na
+var bool  blkPHbrk = true
+var bool  blkPLbrk = true
+var array<box>   blkBoxes  = array.new<box>()
+var array<line>  blkLines  = array.new<line>()
+var array<label> blkLabels = array.new<label>()
+
+f_blkRm(i) =>
+    array.remove(blkTop, i)
+    array.remove(blkBot, i)
+    array.remove(blkDir, i)
+    array.remove(blkBorn, i)
+    array.remove(blkTest, i)
+    array.remove(blkVr, i)
+    array.remove(blkDl, i)
+
+f_blkAdd(pT, pB, pDir, pBorn, pVr, pDl) =>
+    bool dup = false
+    int n = array.size(blkBorn)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(blkBorn, k) == pBorn and array.get(blkDir, k) == pDir
+                dup := true
+                break
+    if not dup
+        array.push(blkTop, pT)
+        array.push(blkBot, pB)
+        array.push(blkDir, pDir)
+        array.push(blkBorn, pBorn)
+        array.push(blkTest, 0)
+        array.push(blkVr, pVr)
+        array.push(blkDl, pDl)
+        if array.size(blkTop) > blkMaxTrack
+            f_blkRm(0)
+    not dup
+
+// Series auxiliares (se evaluan en todas las barras)
+float blkBphN   = ta.pivothigh(high, blkPivot, blkPivot)
+float blkBplN   = ta.pivotlow(low, blkPivot, blkPivot)
+int   blkLowOff = -ta.lowestbars(low, blkLook)
+int   blkHiOff  = -ta.highestbars(high, blkLook)
+float blkVolAvg = ta.sma(nz(volume), 20)
+
+if not na(blkBphN)
+    blkPH := blkBphN
+    blkPHbrk := false
+if not na(blkBplN)
+    blkPL := blkBplN
+    blkPLbrk := false
+
+bool blkNewBull = false
+bool blkNewBear = false
+bool blkTapBull = false
+bool blkTapBear = false
+
+// ---- Ciclo de vida: invalidacion, tests y retests (solo barras cerradas) ----
+if barstate.isconfirmed and blkOn
+    int nBk = array.size(blkTop)
+    if nBk > 0
+        for i = nBk - 1 to 0
+            float bkT = array.get(blkTop, i)
+            float bkB = array.get(blkBot, i)
+            int bkD = array.get(blkDir, i)
+            int bkBorn = array.get(blkBorn, i)
+            float bkMid = (bkT + bkB) / 2.0
+            bool bkInv = bkD == 1 ? (blkMitMode == "Cierre" ? close < bkB : low < bkB) : (blkMitMode == "Cierre" ? close > bkT : high > bkT)
+            bool bkOld = bar_index - bkBorn > blkMaxAge
+            if bkInv or bkOld
+                f_blkRm(i)
+            else if bar_index > bkBorn + 1
+                if bkD == 1
+                    if low <= bkT
+                        if low[1] > bkT
+                            array.set(blkTest, i, array.get(blkTest, i) + 1)
+                        if close >= bkMid
+                            blkTapBull := true
+                else
+                    if high >= bkB
+                        if high[1] < bkB
+                            array.set(blkTest, i, array.get(blkTest, i) + 1)
+                        if close <= bkMid
+                            blkTapBear := true
+
+// ---- Deteccion: BOS alcista -> OB alcista ----
+if barstate.isconfirmed and blkOn and not na(atrVal) and not na(blkPH) and not blkPHbrk and close > blkPH
+    blkPHbrk := true
+    int blkKb = -1
+    for j = blkLowOff to math.min(blkLowOff + 3, blkLook + 2)
+        if close[j] < open[j]
+            blkKb := j
+            break
+    if blkKb >= 0
+        float blkTb = blkBodyOnly ? math.max(open[blkKb], close[blkKb]) : high[blkKb]
+        float blkBb = blkBodyOnly ? math.min(open[blkKb], close[blkKb]) : low[blkKb]
+        float blkSzb = (blkTb - blkBb) / atrVal
+        if blkSzb >= blkMinAtr and blkSzb <= blkMaxAtrSz
+            float blkAvgB = nz(blkVolAvg[blkKb])
+            float blkVrB = blkAvgB > 0 ? nz(volume[blkKb]) / blkAvgB : 1.0
+            if f_blkAdd(blkTb, blkBb, 1, bar_index - blkKb, blkVrB, nz(barDelta[blkKb]))
+                blkNewBull := true
+
+// ---- Deteccion: BOS bajista -> OB bajista ----
+if barstate.isconfirmed and blkOn and not na(atrVal) and not na(blkPL) and not blkPLbrk and close < blkPL
+    blkPLbrk := true
+    int blkKs = -1
+    for j = blkHiOff to math.min(blkHiOff + 3, blkLook + 2)
+        if close[j] > open[j]
+            blkKs := j
+            break
+    if blkKs >= 0
+        float blkTs = blkBodyOnly ? math.max(open[blkKs], close[blkKs]) : high[blkKs]
+        float blkBs = blkBodyOnly ? math.min(open[blkKs], close[blkKs]) : low[blkKs]
+        float blkSzs = (blkTs - blkBs) / atrVal
+        if blkSzs >= blkMinAtr and blkSzs <= blkMaxAtrSz
+            float blkAvgS = nz(blkVolAvg[blkKs])
+            float blkVrS = blkAvgS > 0 ? nz(volume[blkKs]) / blkAvgS : 1.0
+            if f_blkAdd(blkTs, blkBs, -1, bar_index - blkKs, blkVrS, nz(barDelta[blkKs]))
+                blkNewBear := true
+
+// ---- Marcas de retest ----
+plotshape(blkShowTap and blkTapBull, title="OB: retest alcista", style=shape.arrowup, location=location.belowbar, color=blkBullCol, size=size.small, text="OB+", textcolor=blkBullCol)
+plotshape(blkShowTap and blkTapBear, title="OB: retest bajista", style=shape.arrowdown, location=location.abovebar, color=blkBearCol, size=size.small, text="OB-", textcolor=blkBearCol)
+
+// ---- Dibujo (solo ultima barra; no toca los objetos del DOL ni del VP) ----
+if barstate.islast
+    for bx in blkBoxes
+        box.delete(bx)
+    array.clear(blkBoxes)
+    for ln2 in blkLines
+        line.delete(ln2)
+    array.clear(blkLines)
+    for lb2 in blkLabels
+        label.delete(lb2)
+    array.clear(blkLabels)
+    if blkOn
+        int nDw = array.size(blkTop)
+        if nDw > 0
+            for i = 0 to nDw - 1
+                float dT = array.get(blkTop, i)
+                float dB = array.get(blkBot, i)
+                int dD = array.get(blkDir, i)
+                int dTst = array.get(blkTest, i)
+                int dL = math.max(array.get(blkBorn, i), bMin)
+                int dR = bar_index + 12
+                color dC = dD == 1 ? blkBullCol : blkBearCol
+                float dM = (dT + dB) / 2.0
+                array.push(blkBoxes, box.new(dL, dT, dR, dB, border_color=color.new(dC, 30), border_width=1, bgcolor=color.new(dC, math.min(95, 80 + dTst * 5))))
+                if blkShowMid
+                    array.push(blkLines, line.new(dL, dM, dR, dM, color=color.new(dC, 30), style=line.style_dotted, width=1))
+                if blkShowLbl
+                    string dTxt = (dD == 1 ? "OB+ " : "OB- ") + str.tostring(array.get(blkVr, i), "0.0") + "x vol" + (array.get(blkDl, i) >= 0 ? " Δ+" : " Δ-") + (dTst > 0 ? " · test " + str.tostring(dTst) : "")
+                    array.push(blkLabels, label.new(dR, dM, dTxt, style=label.style_label_left, color=color.new(dC, 100), textcolor=dC, size=size.tiny))
+
+// =====================================================================
+//  MODULO 5: SESSION HIGHS & LOWS (Asia / London / New York)
+//  Estado propio (prefijos "s" y "ses"). Solo intradia.
+//   - Al cerrar cada barra se actualiza el rango de la sesion en curso; al terminar se archiva.
+//   - Se dibuja: sesion en vivo (o la mas reciente de su tipo) brillante y proyectada; anteriores atenuadas.
+//   - Los extremos de la ultima sesion completada alimentan el DOL (ver f_nearLiq / f_eval / barridas).
+// =====================================================================
+var array<line>  sesLn  = array.new<line>()
+var array<label> sesLb  = array.new<label>()
+var array<box>   sesBx  = array.new<box>()
+var table sesTbl = table.new(sesPosV, 5, 5, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+f_inSes(h, tz) =>
+    not na(time(timeframe.period, h, tz))
+
+bool sesWin = bar_index >= last_bar_index - 3000   // las sesiones solo se calculan en las ultimas 3000 velas
+bool sInA = sesWin and f_inSes(sesAsiaHrs, sesAsiaTz)
+bool sInL = sesWin and f_inSes(sesLdnHrs, sesLdnTz)
+bool sInN = sesWin and f_inSes(sesNyHrs, sesNyTz)
+
+if barstate.isconfirmed and sesOn and timeframe.isintraday
+    bool[] inArr = array.from(sInA, sInL, sInN)
+    bool[] enArr = array.from(sesAsiaOn, sesLdnOn, sesNyOn)
+    for k = 0 to 2
+        bool inNow = array.get(inArr, k) and array.get(enArr, k)
+        bool was = array.get(sAct, k)
+        if inNow
+            if not was
+                array.set(sCH, k, high)
+                array.set(sCL, k, low)
+                array.set(sCB0, k, bar_index)
+                array.set(sAct, k, true)
+            else
+                array.set(sCH, k, math.max(array.get(sCH, k), high))
+                array.set(sCL, k, math.min(array.get(sCL, k), low))
+            array.set(sCB1, k, bar_index)
+        else if was
+            array.push(sPK, k)
+            array.push(sPH, array.get(sCH, k))
+            array.push(sPL, array.get(sCL, k))
+            array.push(sPB0, array.get(sCB0, k))
+            array.push(sPB1, array.get(sCB1, k))
+            array.set(sesLastH, k, array.get(sCH, k))
+            array.set(sesLastL, k, array.get(sCL, k))
+            array.set(sAct, k, false)
+            int cntK = 0
+            int firstK = -1
+            for j = 0 to array.size(sPK) - 1
+                if array.get(sPK, j) == k
+                    cntK += 1
+                    if firstK == -1
+                        firstK := j
+            if cntK > sesKeep + 1 and firstK >= 0
+                array.remove(sPK, firstK)
+                array.remove(sPH, firstK)
+                array.remove(sPL, firstK)
+                array.remove(sPB0, firstK)
+                array.remove(sPB1, firstK)
+
+// Dibuja un nivel (linea + etiqueta). right = nivel vivo/proyectado (etiqueta a la derecha, linea gruesa);
+// si no, etiqueta a la izquierda, donde abrio la sesion (arriba del nivel si es high, abajo si es low).
+f_sesBox(x0raw, x1, hi, lo, col) =>
+    if x1 > bMin
+        array.push(sesBx, box.new(math.max(x0raw, bMin), hi, x1, lo, border_color=color.new(col, 70), border_width=1, bgcolor=color.new(col, 90)))
+
+f_sesLevel(px, x0raw, x1, col, right, isHigh, tag) =>
+    int x0 = math.max(x0raw, bMin)
+    array.push(sesLn, line.new(x0, px, x1, px, color=col, width=right ? 2 : 1))
+    string t = sesLblMode == "Solo precio" ? str.tostring(px, format.mintick) : tag + (isHigh ? " H " : " L ") + str.tostring(px, format.mintick)
+    if right
+        array.push(sesLb, label.new(x1, px, t, style=label.style_label_left, color=color.new(col, 100), textcolor=col, size=size.small))
+    else
+        array.push(sesLb, label.new(x0, px, t, style=isHigh ? label.style_label_down : label.style_label_up, color=color.new(col, 100), textcolor=col, size=size.tiny))
+
+if barstate.islast
+    for sl0 in sesLn
+        line.delete(sl0)
+    array.clear(sesLn)
+    for sb0 in sesLb
+        label.delete(sb0)
+    array.clear(sesLb)
+    for sx0 in sesBx
+        box.delete(sx0)
+    array.clear(sesBx)
+    if sesOn and timeframe.isintraday
+        int xRs = bar_index + 12
+        bool[] inNowA = array.from(sInA, sInL, sInN)
+        bool[] enA = array.from(sesAsiaOn, sesLdnOn, sesNyOn)
+        color[] cLiveA = array.from(sesAsiaCol, sesLdnCol, sesNyCol)
+        color[] cPastA = array.from(sesAsiaPast, sesLdnPast, sesNyPast)
+        string[] nmA = array.from("ASIA", "LDN", "NY")
+        string[] nmLongA = array.from("Asia", "London", "New York")
+        if sesShowTbl
+            table.cell(sesTbl, 0, 0, "Sesion", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+            table.cell(sesTbl, 1, 0, "High", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+            table.cell(sesTbl, 2, 0, "Low", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+            table.cell(sesTbl, 3, 0, "Rango", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+            table.cell(sesTbl, 4, 0, "Rango %", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+        int nP = array.size(sPK)
+        for k = 0 to 2
+            bool en = array.get(enA, k)
+            bool nowIn = array.get(inNowA, k) and en
+            color cl = array.get(cLiveA, k)
+            color cp = array.get(cPastA, k)
+            string nm = array.get(nmA, k)
+            int lastJ = -1
+            if en and nP > 0
+                for j = 0 to nP - 1
+                    if array.get(sPK, j) == k
+                        lastJ := j
+            if en and nP > 0
+                for j = 0 to nP - 1
+                    if array.get(sPK, j) == k and (array.get(sPB1, j) >= bMin or (j == lastJ and not nowIn))
+                        bool bright = j == lastJ and not nowIn
+                        int jb1 = math.max(bright and sesProject ? xRs : array.get(sPB1, j), bMin + 1)   // la sesion mas reciente siempre se dibuja, recortada a la ventana visible
+                        if sesShade
+                            f_sesBox(array.get(sPB0, j), array.get(sPB1, j), array.get(sPH, j), array.get(sPL, j), bright ? cl : cp)
+                        f_sesLevel(array.get(sPH, j), array.get(sPB0, j), jb1, bright ? cl : cp, bright, true, nm)
+                        f_sesLevel(array.get(sPL, j), array.get(sPB0, j), jb1, bright ? cl : cp, bright, false, nm)
+            float vH = na
+            float vL = na
+            if nowIn
+                bool act = array.get(sAct, k)
+                vH := act ? math.max(array.get(sCH, k), high) : high
+                vL := act ? math.min(array.get(sCL, k), low) : low
+                int vb0 = act ? array.get(sCB0, k) : bar_index
+                if sesShade
+                    f_sesBox(vb0, bar_index, vH, vL, cl)
+                f_sesLevel(vH, vb0, xRs, cl, true, true, nm)
+                f_sesLevel(vL, vb0, xRs, cl, true, false, nm)
+            else if lastJ >= 0
+                vH := array.get(sPH, lastJ)
+                vL := array.get(sPL, lastJ)
+            if sesShowTbl
+                int r = k + 1
+                bool has = not na(vH) and not na(vL)
+                table.cell(sesTbl, 0, r, (nowIn ? "● " : "") + array.get(nmLongA, k), text_color=cl, text_halign=text.align_left, text_size=size.small)
+                table.cell(sesTbl, 1, r, has ? str.tostring(vH, format.mintick) : "-", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+                table.cell(sesTbl, 2, r, has ? str.tostring(vL, format.mintick) : "-", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+                table.cell(sesTbl, 3, r, has ? str.tostring(vH - vL, format.mintick) : "-", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+                table.cell(sesTbl, 4, r, has and vL > 0 ? str.tostring((vH - vL) / vL * 100.0, "0.00") + "%" : "-", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+        if sesShowTbl
+            table.cell(sesTbl, 0, 4, "Estado", text_color=color.new(color.silver, 0), text_halign=text.align_left, text_size=size.small)
+            table.cell(sesTbl, 1, 4, "TF " + timeframe.period + " · guardadas " + str.tostring(nP) + " · ahora: " + (sInA ? "Asia " : "") + (sInL ? "London " : "") + (sInN ? "NY" : "") + ((sInA or sInL or sInN) ? "" : "ninguna"), text_color=color.new(color.silver, 0), text_halign=text.align_left, text_size=size.small)
+            table.merge_cells(sesTbl, 1, 4, 4, 4)
+    else if sesShowTbl
+        table.cell(sesTbl, 0, 0, "Sesiones: solo graficos intradia", text_color=color.new(color.silver, 0), text_halign=text.align_left, text_size=size.small)
+
+// POT % y BBR % solo en barra de estado / Data Window (no dibujan nada en el grafico)
+plot(pShown * 100.0, title="POT", display=display.status_line + display.data_window)
+plot(bbrSm * 100.0, title="BBR", display=display.status_line + display.data_window)
+
+// ===================== ALERTS =====================
+bool potCross = not na(pShown) and pShown * 100.0 >= alertPot and nz(pShown[1]) * 100.0 < alertPot
+alertcondition(targetChanged, title="Target changed", message="Trading DOL: nuevo target FVG")
+alertcondition(tgtHitNow, title="Target touched", message="Trading DOL: target FVG tocado")
+alertcondition(potCross, title="POT crossed threshold", message="Trading DOL: POT del target supero el umbral")
+alertcondition(newBFvg or newBeFvg, title="New FVG (BFVG / BeFVG)", message="Trading DOL: nuevo FVG (BFVG o BeFVG)")
+alertcondition(newBOb or newBeOb, title="New DOL order block (BOB / BeOB)", message="Trading DOL: nuevo order block (BOB o BeOB)")
+alertcondition(bslSweptNow, title="BSL swept", message="Trading DOL: BSL barrida (sesgo bajista)")
+alertcondition(sslSweptNow, title="SSL swept", message="Trading DOL: SSL barrida (sesgo alcista)")
+alertcondition(newMssBull or newMssBear, title="Sweep + MSS confirmed", message="Trading DOL: barrida + MSS confirmado")
+alertcondition(oflEvImbBuy or oflEvImbSell, title="OF: Delta extremo", message="Order Flow: delta extremo")
+alertcondition(oflEvAbsBuy or oflEvAbsSell, title="OF: Absorcion", message="Order Flow: absorcion")
+alertcondition(oflEvDivBull or oflEvDivBear, title="OF: Divergencia CVD (ventana)", message="Order Flow: divergencia CVD")
+alertcondition(oflEvPDivBull or oflEvPDivBear, title="OF: Divergencia CVD (pivotes)", message="Order Flow: divergencia CVD por pivotes")
+alertcondition(oflEvFlipBuy or oflEvFlipSell, title="OF: Delta flip", message="Order Flow: delta flip")
+alertcondition(oflEvFadeUp or oflEvFadeDn, title="OF: Rechazo de delta", message="Order Flow: rechazo de delta (max/min devuelto)")
+alertcondition(oflEvExhBuy or oflEvExhSell, title="OF: Agotamiento", message="Order Flow: agotamiento")
+alertcondition(blkNewBull or blkNewBear, title="OB: nuevo order block", message="Order Block: nuevo OB (alcista o bajista)")
+alertcondition(blkTapBull or blkTapBear, title="OB: retest de order block", message="Order Block: retest de OB (alcista o bajista)")
