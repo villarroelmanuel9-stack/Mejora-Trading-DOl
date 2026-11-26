@@ -192,3 +192,15 @@ Las alertas dinámicas usan `alert()` e incluyen tipo, nivel, puntuación y PoT.
 - [ ] OTE (Optimal Trade Entry, Fibonacci 62–79%).
 - [ ] SMT divergence entre activos correlacionados.
 - [ ] Backtest de tasa de acierto del DOL (para calibrar los pesos y el PoT).
+
+
+---
+
+## 🔌 MetaTrader MCP Server (carpeta `metatrader-mcp-server/`)
+
+Copia del proyecto open source [ariadng/metatrader-mcp-server](https://github.com/ariadng/metatrader-mcp-server) (licencia MIT, commit `bd2ff59`). Es un **puente entre Claude y MetaTrader 5**: permite consultar la cuenta y los precios y **ejecutar operaciones reales** desde lenguaje natural.
+
+- **Requisitos:** Windows con MetaTrader 5 instalado y abierto, y Python 3.10+. No funciona en Mac/Linux ni en la nube.
+- **Credenciales:** van en un archivo `.env` (ver `.env.example`) **solo en tu PC**. Nunca lo subas a GitHub; el `.gitignore` de la carpeta ya lo excluye.
+- **Cambios respecto al original:** no se incluyeron `build/` ni `dist/` (archivos compilados), ni el enlace `.claude/skills`, que activaba automáticamente un skill que ejecuta órdenes **sin pedir confirmación**. El skill sigue disponible como texto en `claude-skill/trading/SKILL.md`.
+- ⚠️ Con esto una IA puede abrir y cerrar operaciones con dinero real. Pruébalo primero en una **cuenta demo**.
