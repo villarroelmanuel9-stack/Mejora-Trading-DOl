@@ -46,6 +46,24 @@ mcp = FastMCP(
 # 3) Register tools with @mcp.tool()
 # ────────────────────────────────────────────────────────────────────────────────
 
+# READ-ONLY MODE (local change in this copy).
+# By default only tools that READ data are exposed (account, positions, orders,
+# prices, candles, history). Tools that place, modify, close or cancel orders are
+# registered only when MT5_READ_ONLY=false (CLI: --allow-trading).
+load_dotenv()
+READ_ONLY = os.getenv("MT5_READ_ONLY", "true").strip().lower() not in ("0", "false", "no", "off")
+if READ_ONLY:
+	logging.getLogger(__name__).info("MetaTrader MCP running in READ-ONLY mode: trading tools are disabled")
+
+def trading_tool():
+	"""Like @mcp.tool(), but the tool is only registered when trading is enabled."""
+	def decorator(fn):
+		if READ_ONLY:
+			return fn
+		return mcp.tool()(fn)
+	return decorator
+
+
 @mcp.tool()
 def get_account_info(ctx: Context) -> dict:
 	"""Get account information (balance, equity, profit, margin level, free margin, account type, leverage, currency)."""
@@ -145,7 +163,7 @@ def get_pending_orders_by_id(ctx: Context, id: Union[int, str]) -> list:
 	df = client.order.get_pending_orders_by_id(id=id)
 	return df.to_csv() if hasattr(df, 'to_csv') else str(df)
 
-@mcp.tool()
+@trading_tool()
 def place_market_order(ctx: Context, symbol: str, volume: float, type: str) -> dict:
 	"""
 	Place a market order. Parameters:
@@ -156,7 +174,7 @@ def place_market_order(ctx: Context, symbol: str, volume: float, type: str) -> d
 	client = get_client(ctx)
 	return client.order.place_market_order(symbol=symbol, volume=volume, type=type)
 
-@mcp.tool()
+@trading_tool()
 def place_pending_order(ctx: Context, symbol: str, volume: float, type: str, price: float, stop_loss: Optional[Union[int, float]] = 0.0, take_profit: Optional[Union[int, float]] = 0.0) -> dict:
 	"""
 	Place a pending order. Parameters:
@@ -170,59 +188,59 @@ def place_pending_order(ctx: Context, symbol: str, volume: float, type: str, pri
 	client = get_client(ctx)
 	return client.order.place_pending_order(symbol=symbol, volume=volume, type=type, price=price, stop_loss=stop_loss, take_profit=take_profit)
 
-@mcp.tool()
+@trading_tool()
 def modify_position(ctx: Context, id: Union[int, str], stop_loss: Optional[Union[int, float]] = None, take_profit: Optional[Union[int, float]] = None) -> dict:
 	"""Modify an open position by ID."""
 	client = get_client(ctx)
 	return client.order.modify_position(id=id, stop_loss=stop_loss, take_profit=take_profit)
-@mcp.tool()
+@trading_tool()
 def modify_pending_order(ctx: Context, id: Union[int, str], price: Optional[Union[int, float]] = None, stop_loss: Optional[Union[int, float]] = None, take_profit: Optional[Union[int, float]] = None) -> dict:
 	"""Modify a pending order by ID."""
 	client = get_client(ctx)
 	return client.order.modify_pending_order(id=id, price=price, stop_loss=stop_loss, take_profit=take_profit)
-@mcp.tool()
+@trading_tool()
 def close_position(ctx: Context, id: Union[int, str]) -> dict:
 	"""Close an open position by ID."""
 	client = get_client(ctx)
 	return client.order.close_position(id=id)
 
-@mcp.tool()
+@trading_tool()
 def cancel_pending_order(ctx: Context, id: Union[int, str]) -> dict:
 	"""Cancel a pending order by ID."""
 	client = get_client(ctx)
 	return client.order.cancel_pending_order(id=id)
 
-@mcp.tool()
+@trading_tool()
 def close_all_positions(ctx: Context) -> dict:
 	"""Close all open positions."""
 	client = get_client(ctx)
 	return client.order.close_all_positions()
 
-@mcp.tool()
+@trading_tool()
 def close_all_positions_by_symbol(ctx: Context, symbol: str) -> dict:
 	"""Close all open positions for a specific symbol."""
 	client = get_client(ctx)
 	return client.order.close_all_positions_by_symbol(symbol=symbol)
 
-@mcp.tool()
+@trading_tool()
 def close_all_profitable_positions(ctx: Context) -> dict:
 	"""Close all profitable positions."""
 	client = get_client(ctx)
 	return client.order.close_all_profitable_positions()
 
-@mcp.tool()
+@trading_tool()
 def close_all_losing_positions(ctx: Context) -> dict:
 	"""Close all losing positions."""
 	client = get_client(ctx)
 	return client.order.close_all_losing_positions()
 
-@mcp.tool()
+@trading_tool()
 def cancel_all_pending_orders(ctx: Context) -> dict:
 	"""Cancel all pending orders."""
 	client = get_client(ctx)
 	return client.order.cancel_all_pending_orders()
 
-@mcp.tool()
+@trading_tool()
 def cancel_pending_orders_by_symbol(ctx: Context, symbol: str) -> dict:
 	"""Cancel all pending orders for a specific symbol."""
 	client = get_client(ctx)

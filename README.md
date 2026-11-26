@@ -198,9 +198,39 @@ Las alertas dinámicas usan `alert()` e incluyen tipo, nivel, puntuación y PoT.
 
 ## 🔌 MetaTrader MCP Server (carpeta `metatrader-mcp-server/`)
 
-Copia del proyecto open source [ariadng/metatrader-mcp-server](https://github.com/ariadng/metatrader-mcp-server) (licencia MIT, commit `bd2ff59`). Es un **puente entre Claude y MetaTrader 5**: permite consultar la cuenta y los precios y **ejecutar operaciones reales** desde lenguaje natural.
+Copia del proyecto open source [ariadng/metatrader-mcp-server](https://github.com/ariadng/metatrader-mcp-server) (licencia MIT, commit `bd2ff59`). Es un **puente entre Claude y MetaTrader 5**: deja ver la cuenta, las posiciones, los precios y el historial desde Claude.
 
-- **Requisitos:** Windows con MetaTrader 5 instalado y abierto, y Python 3.10+. No funciona en Mac/Linux ni en la nube.
-- **Credenciales:** van en un archivo `.env` (ver `.env.example`) **solo en tu PC**. Nunca lo subas a GitHub; el `.gitignore` de la carpeta ya lo excluye.
-- **Cambios respecto al original:** no se incluyeron `build/` ni `dist/` (archivos compilados), ni el enlace `.claude/skills`, que activaba automáticamente un skill que ejecuta órdenes **sin pedir confirmación**. El skill sigue disponible como texto en `claude-skill/trading/SKILL.md`.
-- ⚠️ Con esto una IA puede abrir y cerrar operaciones con dinero real. Pruébalo primero en una **cuenta demo**.
+### Cambios en esta copia
+- 🔒 **Modo solo lectura por defecto.** Claude solo ve 13 herramientas de lectura: cuenta, posiciones, órdenes pendientes, precios, velas e historial. Las 12 que abren, modifican, cierran o cancelan órdenes se activan solo con `--allow-trading` (o `MT5_READ_ONLY=false`).
+- 🛠 **`mcp[cli]>=1.6.0,<2`**: el original no limitaba la versión, y con `mcp` 2.x (donde `FastMCP` cambió de nombre) el servidor no arranca.
+- No se incluyeron `build/` ni `dist/` (archivos compilados), ni el enlace `.claude/skills`, que activaba un skill que ejecuta órdenes **sin pedir confirmación**. El texto sigue en `claude-skill/trading/SKILL.md`.
+
+### Instalación en Windows (para ver tu cuenta desde Claude Desktop)
+**Necesitas:** PC con **Windows**, **MetaTrader 5** con tu cuenta abierta, **Python 3.10+** (al instalar, marca *Add Python to PATH*) y la app **Claude Desktop**.
+
+1. **Descarga este repositorio:** en GitHub, *Code → Download ZIP*, y descomprímelo, por ejemplo en `C:\Trading\Mejora-Trading-DOl`.
+2. **Instala el servidor desde esta carpeta.** Hazlo así y no con `pip install metatrader-mcp-server`, porque esa es la versión original, sin modo solo lectura. Abre *Símbolo del sistema* y ejecuta:
+   ```
+   pip install "C:\Trading\Mejora-Trading-DOl\metatrader-mcp-server"
+   ```
+3. **Usa tu contraseña de inversor** (*investor password*). Es la contraseña de **solo lectura** de MT5: con ella la cuenta **no puede operar**, aunque algo falle. La encuentras en MT5, en *Archivo → Abrir cuenta / Cambiar contraseña*, o en el correo de tu bróker.
+4. **Configura Claude Desktop.** Abre `%APPDATA%\Claude\claude_desktop_config.json` y pon:
+   ```json
+   {
+     "mcpServers": {
+       "metatrader": {
+         "command": "metatrader-mcp-server",
+         "args": [
+           "--login",     "TU_NUMERO_DE_CUENTA",
+           "--password",  "TU_CONTRASEÑA_DE_INVERSOR",
+           "--server",    "NOMBRE_DEL_SERVIDOR",
+           "--transport", "stdio"
+         ]
+       }
+     }
+   }
+   ```
+   El número de cuenta y el servidor aparecen en MT5, en *Archivo → Iniciar sesión en cuenta de trading*. Este archivo queda **solo en tu PC**: nunca lo subas a GitHub.
+5. **Reinicia Claude Desktop** y pregunta: *"Muéstrame mi cuenta y mis posiciones abiertas"*.
+
+⚠️ No agregues `--allow-trading` salvo que realmente quieras que Claude pueda operar, y en ese caso prueba primero en una **cuenta demo**.
