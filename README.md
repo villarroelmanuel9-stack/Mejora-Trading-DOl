@@ -98,6 +98,23 @@ Si un objetivo **del lado contrario**, con confirmación ≥ 60 y a más de la d
 
 Fuentes: [ICT order block types](https://www.tradingview.com/chart/XAUUSD/1WNE1w5D-TYPES-OF-ORDER-BLOCKS/) · [LuxAlgo mitigation block](https://www.luxalgo.com/library/concept/mitigation-block.md) · [LuxAlgo propulsion block](https://www.luxalgo.com/library/concept/propulsion-block.md) · [38,114 FVG tested](https://www.nordman-algorithms.com/blog/do-fair-value-gaps-work/) · [FVG fill probability](https://liquidityscan.io/blog/fvg-fill-probability-what-backtests-reveal-about-win-rates) · [NQ overnight range](https://tradingstats.net/overnight-high-low-breakout-strategy/) · [NQ first 30 minutes](https://www.astreka.com/market-insights/does-the-first-30-minutes-predict-the-rest-of-the-nq-trading-day) · [LuxAlgo HVN/LVN](https://www.luxalgo.com/library/concept/high-low-volume-nodes.md) · [Fed FOMC calendar](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) · [BLS CPI schedule](https://www.bls.gov/schedule/news_release/cpi.htm) · [BLS Employment Situation schedule](https://www.bls.gov/schedule/news_release/empSit.htm)
 
+### ♻️ Lo mejor del indicador anterior ("Trading DOL 1.0 + VP + OF + OB")
+| Idea traída | Implementación en DOL Engine Pro |
+|---|---|
+| Barridas de liquidez ponderadas por **MSS** (100% / 50% / 25%) y por **jerarquía** (sesión 1.1 · día 1.0 · semana 1.25 · mes 1.5) | Detecta mecha más allá de PMH/PML, PWH/PWL, Asia/Londres/NY/OR y PDH/PDL con cierre de vuelta, espera el MSS en 1m (cuerpo ≥ 0.5 ATR) y lo da a la IA, con un decaimiento de 40 velas |
+| **PMH / PML** (mes anterior) | Nuevos objetivos de liquidez, con el mayor peso |
+| **Eventos de order flow**: delta extremo (>2σ), **absorción**, **agotamiento**, **delta flip** (delta % ≥10 iniciativa / <5 balance) y **divergencia del CVD en pivotes** | Sesgo de eventos que se reduce 10% por vela → dato para la IA |
+| **BBR** (Bear Bull Ratio) en modo rango verdadero | Dato para la IA |
+| **OB → breaker al cerrar más allá del 50%** (mean threshold) | Regla del motor de 1H y 15m |
+| **Unicorn** (breaker + FVG del mismo lado) | Zonas `BuUNI` / `BeUNI` con más profundidad y calidad 1.0 |
+| **Perfil compra/venta con delta + POC / VAH / VAL** | Dominancia compradora o vendedora en el camino → dato para la IA. POC, VAH y VAL como objetivos |
+| Premium/Discount continuo y **liquidez más allá del objetivo** | 2 datos para la IA |
+| **Toque en CE (50%)** | Opción *Zone Target at CE* |
+| Tooltip de evidencias **✔ / ✖** | Al tocar la etiqueta del DOL se ve el detalle de cada factor, sin ocupar pantalla |
+| Panel MTF "x/4 a favor" | Fila TIMEFRAME BIAS muestra `2/3 ▲` |
+
+**PoT AI ahora usa 25 datos.**
+
 ### 🧠 Auto-aprendizaje (retroalimentación)
 El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
 
