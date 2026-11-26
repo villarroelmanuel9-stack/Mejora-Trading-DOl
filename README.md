@@ -70,6 +70,31 @@ Si un objetivo **del lado contrario**, con confirmación ≥ 60 y a más de la d
 - Hay una alerta *DOL conflict*.
 - La IA aprende de esto: la probabilidad del lado contrario es su 11.º dato.
 
+### 🧱 Order Blocks, gaps, volumen, aperturas y noticias (v. investigación)
+| Módulo | Qué hace | Cómo ayuda a la precisión |
+|---|---|---|
+| **BuOB / BeOB** (1H y 15m) | Order block = última vela contraria del tramo que rompió estructura (cierre de cuerpo). Calidad 0–1: desplazamiento en ATR, FVG dentro del tramo y volumen relativo | Nuevos objetivos y zonas. La calidad suma profundidad y es un dato para la IA |
+| **BuBB / BeBB** (breakers) | Un OB que falla (cierre a través de él) cambia de polaridad. Se elimina cuando se mitiga | Zonas de reacción en la dirección del nuevo flujo |
+| **FVG + volumen** | Guarda el volumen relativo de la vela que creó el gap | La IA aprende qué gaps se llenan más. Cada zona muestra su **% de llenado** (PoT AI) |
+| **Perfil de volumen** (240 velas, 30 filas) | Volumen en el camino al objetivo (LVN = camino rápido) y en el objetivo (HVN = imán) | 2 datos para la IA |
+| **Divergencia de delta** | Nuevo máximo o mínimo sin confirmación del delta acumulado = absorción | Dato para la IA (a favor o en contra del objetivo) |
+| **Aperturas** | Opening Range de los primeros 30 min (NQ 09:30, oro 08:20) → **ORH/ORL**. **NDOG/NWOG** (gap de apertura diario y semanal, se encoge al llenarse). **MOP** (apertura de medianoche NY, línea de referencia) | Nuevos objetivos. La posición frente al MOP (premium/discount, Power of 3) es un dato para la IA |
+| **Cierre diario** | Sin señales entre 16:50 y 18:05 NY (cierre y reapertura de futuros y oro) | Evita la baja liquidez del cierre |
+| **Tendencia** | EMA 50/200 en 1H | Dato para la IA |
+| **Calendario de noticias** | FOMC (14:00), CPI y NFP (08:30) con fechas oficiales de **dic 2026 a dic 2027** (Fed / BLS). Bloquea señales y DOL nuevos 30 min antes y después. El panel muestra `📰 CPI in 25 min` | Evita entrar justo antes de los saltos de volatilidad |
+
+> Pine Script **no puede leer noticias** (titulares). Solo usa los horarios oficiales cargados. Hay que actualizarlos a fines de 2027.
+
+**PoT AI ahora usa 19 datos:** los 11 anteriores más el volumen del FVG, la calidad del OB, el camino por el perfil de volumen, el volumen en el objetivo, la divergencia de delta, la posición frente al MOP, la EMA de 1H y la cercanía de noticias.
+
+**Lo que dice la investigación (honesto):**
+- No hay estudios verificados de % de llenado de FVG: las cifras publicadas van de ~49% (relleno total) a ~61% (CE/50%) y ~73%, y un test de 38 mil FVG en futuros encontró que vuelven a ellos casi tanto como a niveles al azar. Por eso el indicador **mide el % en tu propio gráfico** en vez de asumirlo.
+- En NQ, el rango overnight se rompe ~94% de los días. Cuando la apertura está sobre la mitad del rango, el máximo se rompe primero ~76% de las veces. Solo ~30–35% de los máximos o mínimos de apertura aguantan todo el día.
+- "Precio rápido por los LVN, lento en los HVN" es una tendencia conocida, no una regla con estadística publicada.
+- Las definiciones de OB, breaker, mitigation, rejection y propulsion block no están estandarizadas. El indicador usa reglas mecánicas fijas.
+
+Fuentes: [ICT order block types](https://www.tradingview.com/chart/XAUUSD/1WNE1w5D-TYPES-OF-ORDER-BLOCKS/) · [LuxAlgo mitigation block](https://www.luxalgo.com/library/concept/mitigation-block.md) · [LuxAlgo propulsion block](https://www.luxalgo.com/library/concept/propulsion-block.md) · [38,114 FVG tested](https://www.nordman-algorithms.com/blog/do-fair-value-gaps-work/) · [FVG fill probability](https://liquidityscan.io/blog/fvg-fill-probability-what-backtests-reveal-about-win-rates) · [NQ overnight range](https://tradingstats.net/overnight-high-low-breakout-strategy/) · [NQ first 30 minutes](https://www.astreka.com/market-insights/does-the-first-30-minutes-predict-the-rest-of-the-nq-trading-day) · [LuxAlgo HVN/LVN](https://www.luxalgo.com/library/concept/high-low-volume-nodes.md) · [Fed FOMC calendar](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) · [BLS CPI schedule](https://www.bls.gov/schedule/news_release/cpi.htm) · [BLS Employment Situation schedule](https://www.bls.gov/schedule/news_release/empSit.htm)
+
 ### 🧠 Auto-aprendizaje (retroalimentación)
 El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
 

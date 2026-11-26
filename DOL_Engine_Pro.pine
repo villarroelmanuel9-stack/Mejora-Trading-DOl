@@ -63,7 +63,7 @@ iNy   = input.session("0930-1100", "New York AM", group = grpS)
 
 grpD = "🖥 Display"
 iShowLevels = input.bool(true, "Liquidity Levels (PDH, LON, ASIA, EQH…)", group = grpD)
-iShowFvg    = input.bool(true, "Engine FVG Zones", group = grpD)
+iShowFvg    = input.bool(true, "Engine Zones (FVG · OB · Breakers · Gaps) with fill %", group = grpD)
 iShowAnchor = input.bool(true, "Anchor FVG", group = grpD)
 iLadderN    = input.int(2, "Ladder Targets on Chart", minval = 0, maxval = 4, group = grpD)
 iShowMS     = input.bool(false, "BOS / MSS (chart TF)", group = grpD)
@@ -92,6 +92,11 @@ iUseNews = input.bool(true, "Block Signals in News Windows", group = grpSF)
 iNews1   = input.session("0825-0840", "News Window 1", group = grpSF)
 iNews2   = input.session("0955-1005", "News Window 2", group = grpSF)
 iNews3   = input.session("1355-1410", "News Window 3", group = grpSF)
+iUseCal  = input.bool(true, "High-Impact News Calendar (FOMC · CPI · NFP)", group = grpSF,
+     tooltip = "Official dates Dec 2026 – Dec 2027 (Fed / BLS). Blocks signals and new DOLs around the release. Pine cannot read news headlines, only these scheduled times.")
+iNewsPre  = input.int(30, "Minutes Before News", minval = 0, maxval = 240, group = grpSF)
+iNewsPost = input.int(30, "Minutes After News", minval = 0, maxval = 240, group = grpSF)
+iUseClose = input.bool(true, "Block Signals at Daily Close (16:50-18:05 NY)", group = grpSF)
 iUsePD   = input.bool(true, "Premium / Discount Filter", group = grpSF,
      tooltip = "SELL only if the sweep happened in premium (above the 2-day range midpoint), BUY only in discount.")
 iSmtSym  = input.symbol("", "SMT Symbol (blank = preset pair)", group = grpSF,
@@ -133,6 +138,8 @@ iCountMode = input.string("Trading day", "DOL Counter Resets At", options = ["Tr
 
 grpF = "🌊 Order Flow"
 iFlowLen = input.int(30, "Delta Lookback (chart bars)", minval = 5, group = grpF)
+iVpBars  = input.int(240, "Volume Profile Lookback (chart bars)", minval = 60, maxval = 400, group = grpF,
+     tooltip = "Rolling volume profile: targets reached through low-volume areas (LVN) travel faster; high-volume nodes (HVN) act as magnets.")
 iShowImb = input.bool(false, "Mark Volume Imbalance Bars", group = grpF)
 iImbRvol = input.float(2.5, "Imbalance RVOL ≥", minval = 1.0, step = 0.1, group = grpF)
 
@@ -218,6 +225,19 @@ f_engine(int len, float eqTol, float fvgMin) =>
     float a  = nz(ta.atr(14), high - low)
     float ph = ta.pivothigh(high, len, len)
     float pl = ta.pivotlow(low, len, len)
+    // order blocks (BuOB / BeOB) and breakers (BuBB / BeBB)
+    var array<float> oTop = array.new<float>()
+    var array<float> oBtm = array.new<float>()
+    var array<int>   oT   = array.new<int>()
+    var array<int>   oD   = array.new<int>()      // 1 = bullish block (support), -1 = bearish block (resistance)
+    var array<float> oQ   = array.new<float>()    // quality 0-1: displacement · FVG in the leg · volume
+    var array<int>   oB   = array.new<int>()      // 0 = order block, 1 = breaker (failed OB, polarity flipped)
+    var array<float> fRV  = array.new<float>()    // relative volume of the candle that created each FVG
+    var int lastBullFvg = -100
+    var int lastBearFvg = -100
+    float vAvg = ta.sma(nz(volume, 1.0), 20)
+    float e50  = ta.ema(close, 50)
+    float e200 = ta.ema(close, 200)
 
     // sweeps of resting liquidity
     if hiP.size() > 0
@@ -252,6 +272,7 @@ f_engine(int len, float eqTol, float fvgMin) =>
                 fBtm.remove(i)
                 fT.remove(i)
                 fD.remove(i)
+                fRV.remove(i)
 
     // new swing highs → BSL / EQH
     if not na(ph)
@@ -295,30 +316,107 @@ f_engine(int len, float eqTol, float fvgMin) =>
                 loT.shift()
                 loE.shift()
 
-    // structure bias (candle body close through the last swing)
+    // order blocks: mitigation (price returns into the block) and failure (close through it → breaker)
+    if oTop.size() > 0
+        for i = oTop.size() - 1 to 0
+            float tp   = oTop.get(i)
+            float bt   = oBtm.get(i)
+            bool  drop = false
+            if oD.get(i) == 1
+                if close < bt
+                    if oB.get(i) == 0
+                        oD.set(i, -1)
+                        oB.set(i, 1)
+                    else
+                        drop := true
+                else if low <= tp
+                    drop := true
+            else
+                if close > tp
+                    if oB.get(i) == 0
+                        oD.set(i, 1)
+                        oB.set(i, 1)
+                    else
+                        drop := true
+                else if high >= bt
+                    drop := true
+            if drop
+                oTop.remove(i)
+                oBtm.remove(i)
+                oT.remove(i)
+                oD.remove(i)
+                oQ.remove(i)
+                oB.remove(i)
+
+    // structure bias (candle body close through the last swing) + the order block that caused it
     if not na(sh) and close > sh
         bias := 1
         sh   := na
+        // BuOB = last down-close candle of the leg that broke structure
+        int j = -1
+        for k = 1 to 10
+            if close[k] < open[k]
+                j := k
+                break
+        if j > 0
+            float disp = (close - low[j]) / math.max(a, syminfo.mintick)
+            float rvj  = nz(volume[j]) / math.max(nz(vAvg[j], 1.0), 1e-9)
+            float q    = 0.4 * math.min(disp / 3.0, 1.0) + 0.3 * (bar_index - lastBullFvg <= j + 1 ? 1.0 : 0.0) + 0.3 * math.min(rvj / 2.0, 1.0)
+            oTop.push(high[j])
+            oBtm.push(low[j])
+            oT.push(time[j])
+            oD.push(1)
+            oQ.push(q)
+            oB.push(0)
     if not na(sl) and close < sl
         bias := -1
         sl   := na
+        // BeOB = last up-close candle of the leg that broke structure
+        int j = -1
+        for k = 1 to 10
+            if close[k] > open[k]
+                j := k
+                break
+        if j > 0
+            float disp = (high[j] - close) / math.max(a, syminfo.mintick)
+            float rvj  = nz(volume[j]) / math.max(nz(vAvg[j], 1.0), 1e-9)
+            float q    = 0.4 * math.min(disp / 3.0, 1.0) + 0.3 * (bar_index - lastBearFvg <= j + 1 ? 1.0 : 0.0) + 0.3 * math.min(rvj / 2.0, 1.0)
+            oTop.push(high[j])
+            oBtm.push(low[j])
+            oT.push(time[j])
+            oD.push(-1)
+            oQ.push(q)
+            oB.push(0)
+    if oTop.size() > 12
+        oTop.shift()
+        oBtm.shift()
+        oT.shift()
+        oD.shift()
+        oQ.shift()
+        oB.shift()
 
     // new FVGs
+    float rvGap = nz(volume[1]) / math.max(nz(vAvg[1], 1.0), 1e-9)
     if low > high[2] and low - high[2] >= fvgMin * a
         fTop.push(low)
         fBtm.push(high[2])
         fT.push(time[1])
         fD.push(1)
+        fRV.push(rvGap)
+        lastBullFvg := bar_index
     if high < low[2] and low[2] - high >= fvgMin * a
         fTop.push(low[2])
         fBtm.push(high)
         fT.push(time[1])
         fD.push(-1)
+        fRV.push(rvGap)
+        lastBearFvg := bar_index
     if fTop.size() > 12
         fTop.shift()
         fBtm.shift()
         fT.shift()
         fD.shift()
+        fRV.shift()
 
     // nearest liquidity above / below + nearest equal-highs/lows cluster
     float bP  = na
@@ -366,9 +464,11 @@ f_engine(int len, float eqTol, float fvgMin) =>
     float uTop = na
     float uBtm = na
     int   uT   = na
+    float uRV  = 0.0
     float dTop = na
     float dBtm = na
     int   dT   = na
+    float dRV  = 0.0
     if fTop.size() > 0
         for i = 0 to fTop.size() - 1
             float tp = fTop.get(i)
@@ -377,11 +477,41 @@ f_engine(int len, float eqTol, float fvgMin) =>
                 uTop := tp
                 uBtm := bt
                 uT   := fT.get(i)
+                uRV  := fRV.get(i)
             if tp < close and (na(dTop) or tp > dTop)
                 dTop := tp
                 dBtm := bt
                 dT   := fT.get(i)
-    [bP[1], bT[1], bE[1], qhP[1], qhT[1], qhE[1], sP[1], sT[1], sE[1], qlP[1], qlT[1], qlE[1], uTop[1], uBtm[1], uT[1], dTop[1], dBtm[1], dT[1], bias[1], a[1]]
+                dRV  := fRV.get(i)
+    // nearest unmitigated block above (BeOB / BeBB) and below (BuOB / BuBB)
+    float kUT  = na
+    float kUB  = na
+    int   kUTm = na
+    float kUQ  = 0.0
+    int   kUBr = 0
+    float kDT  = na
+    float kDB  = na
+    int   kDTm = na
+    float kDQ  = 0.0
+    int   kDBr = 0
+    if oTop.size() > 0
+        for i = 0 to oTop.size() - 1
+            float tp = oTop.get(i)
+            float bt = oBtm.get(i)
+            if oD.get(i) == -1 and bt > close and (na(kUB) or bt < kUB)
+                kUT  := tp
+                kUB  := bt
+                kUTm := oT.get(i)
+                kUQ  := oQ.get(i)
+                kUBr := oB.get(i)
+            if oD.get(i) == 1 and tp < close and (na(kDT) or tp > kDT)
+                kDT  := tp
+                kDB  := bt
+                kDTm := oT.get(i)
+                kDQ  := oQ.get(i)
+                kDBr := oB.get(i)
+    int emaT = e50 > e200 ? 1 : -1
+    [bP[1], bT[1], bE[1], qhP[1], qhT[1], qhE[1], sP[1], sT[1], sE[1], qlP[1], qlT[1], qlE[1], uTop[1], uBtm[1], uT[1], dTop[1], dBtm[1], dT[1], bias[1], a[1], uRV[1], dRV[1], kUT[1], kUB[1], kUTm[1], kUQ[1], kUBr[1], kDT[1], kDB[1], kDTm[1], kDQ[1], kDBr[1], emaT[1]]
 
 f_bias(int len) =>
     var int   t  = 0
@@ -452,9 +582,38 @@ f_session(string sess, string tz) =>
             lSw := true
     [hSw ? na : H, Ht, lSw ? na : L, Lt, inS]
 
+// opening gap between the previous close and the new open (NDOG / NWOG);
+// shrinks as price trades into it and disappears once fully filled
+f_gap(bool isNew) =>
+    var float gT  = na
+    var float gB  = na
+    var int   gTm = na
+    if isNew
+        float c1 = close[1]
+        if math.abs(open - c1) > syminfo.mintick
+            gT  := math.max(open, c1)
+            gB  := math.min(open, c1)
+            gTm := time
+        else
+            gT := na
+            gB := na
+    else if not na(gT)
+        if low <= gB and high >= gT
+            gT := na
+            gB := na
+        else
+            if low < gT and low > gB
+                gT := low
+            if high > gB and high < gT
+                gB := high
+            if gT - gB <= syminfo.mintick
+                gT := na
+                gB := na
+    [gT, gB, gTm]
+
 // ──────────────────────────────────────────────────────────── DATA FEEDS ────
-[aBP, aBT, aBE, aQhP, aQhT, aQhE, aSP, aST, aSE, aQlP, aQlT, aQlE, aUTop, aUBtm, aUT, aDTop, aDBtm, aDT, rawBiasA, atrA] = request.security(syminfo.tickerid, iTfA, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
-[bBP, bBT, bBE, bQhP, bQhT, bQhE, bSP, bST, bSE, bQlP, bQlT, bQlE, bUTop, bUBtm, bUT, bDTop, bDBtm, bDT, rawBiasB, atrB] = request.security(syminfo.tickerid, iTfB, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
+[aBP, aBT, aBE, aQhP, aQhT, aQhE, aSP, aST, aSE, aQlP, aQlT, aQlE, aUTop, aUBtm, aUT, aDTop, aDBtm, aDT, rawBiasA, atrA, aURV, aDRV, aKUT, aKUB, aKUTm, aKUQ, aKUBr, aKDT, aKDB, aKDTm, aKDQ, aKDBr, aEmaT] = request.security(syminfo.tickerid, iTfA, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
+[bBP, bBT, bBE, bQhP, bQhT, bQhE, bSP, bST, bSE, bQlP, bQlT, bQlE, bUTop, bUBtm, bUT, bDTop, bDBtm, bDT, rawBiasB, atrB, bURV, bDRV, bKUT, bKUB, bKUTm, bKUQ, bKUBr, bKDT, bKDB, bKDTm, bKDQ, bKDBr, bEmaT] = request.security(syminfo.tickerid, iTfB, f_engine(iLen, iEqTol, iFvgMin), lookahead = barmerge.lookahead_on)
 biasA = nz(rawBiasA)
 biasB = nz(rawBiasB)
 biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = barmerge.lookahead_on))
@@ -470,6 +629,18 @@ biasC = nz(request.security(syminfo.tickerid, iTfC, f_bias(iLen), lookahead = ba
 [asH, asHt, asL, asLt, inAsia] = f_session(iAsia, iTz)
 [lnH, lnHt, lnL, lnLt, inLon]  = f_session(iLon, iTz)
 [nyH, nyHt, nyL, nyLt, inNy]   = f_session(iNy, iTz)
+
+// market opens: opening range (first 30 min of the cash / COMEX open), NDOG / NWOG, midnight open
+orSess = inst == "XAU" ? "0820-0850" : "0930-1000"
+[orH, orHt, orL, orLt, inOR] = f_session(orSess, iTz)
+[ndT, ndB, ndTm] = f_gap(timeframe.change("D"))
+[nwT, nwB, nwTm] = f_gap(timeframe.change("W"))
+newNyDay = dayofmonth(time, iTz) != dayofmonth(time[1], iTz)
+var float mop  = na        // midnight (NY) open: ICT "true day" reference
+var int   mopT = na
+if newNyDay
+    mop  := open
+    mopT := time
 
 // SMT divergence vs correlated symbol
 smtOn = smtSym != "" and iSmtMode != "Off"
@@ -506,6 +677,15 @@ delta   = barRng > 0 ? vol * (2.0 * close - high - low) / barRng : 0.0
 sDelta  = math.sum(delta, iFlowLen)
 sVol    = math.sum(vol, iFlowLen)
 flowPct = sVol > 0 ? 50.0 + 50.0 * sDelta / sVol : 50.0
+// cumulative delta divergence: new price extreme without delta confirmation = absorption
+var float cvd = 0.0
+cvd += delta
+pHH = high >= nz(ta.highest(high, 30)[1], high)
+pLL = low <= nz(ta.lowest(low, 30)[1], low)
+cHH = cvd >= nz(ta.highest(cvd, 30)[1], cvd)
+cLL = cvd <= nz(ta.lowest(cvd, 30)[1], cvd)
+divBear = nz(ta.barssince(pHH and not cHH), 999) <= 20     // buyers absorbed at the highs
+divBull = nz(ta.barssince(pLL and not cLL), 999) <= 20     // sellers absorbed at the lows
 
 // volatility for PoT
 chg   = close - close[1]
@@ -520,6 +700,61 @@ f_in(string sess) =>
     not na(time(timeframe.period, sess, iTz))
 inKZ   = f_in(kz1 + "," + kz2 + "," + kz3)
 inNews = f_in(iNews1 + "," + iNews2 + "," + iNews3)
+inClose = iUseClose and f_in("1650-1805")
+
+// high-impact news calendar (official Fed / BLS dates, New York time)
+var array<int>    evT = array.new<int>()
+var array<string> evN = array.new<string>()
+f_ev(string nm, int y, int m, int d, int h, int mi) =>
+    evT.push(timestamp("America/New_York", y, m, d, h, mi))
+    evN.push(nm)
+if barstate.isfirst
+    f_ev("NFP", 2026, 12, 4, 8, 30)
+    f_ev("FOMC", 2026, 12, 9, 14, 0)
+    f_ev("CPI", 2026, 12, 10, 8, 30)
+    f_ev("NFP", 2027, 1, 8, 8, 30)
+    f_ev("CPI", 2027, 1, 13, 8, 30)
+    f_ev("FOMC", 2027, 1, 27, 14, 0)
+    f_ev("NFP", 2027, 2, 5, 8, 30)
+    f_ev("CPI", 2027, 2, 11, 8, 30)
+    f_ev("NFP", 2027, 3, 5, 8, 30)
+    f_ev("CPI", 2027, 3, 10, 8, 30)
+    f_ev("FOMC", 2027, 3, 17, 14, 0)
+    f_ev("NFP", 2027, 4, 2, 8, 30)
+    f_ev("CPI", 2027, 4, 13, 8, 30)
+    f_ev("FOMC", 2027, 4, 28, 14, 0)
+    f_ev("NFP", 2027, 5, 7, 8, 30)
+    f_ev("CPI", 2027, 5, 12, 8, 30)
+    f_ev("NFP", 2027, 6, 4, 8, 30)
+    f_ev("FOMC", 2027, 6, 9, 14, 0)
+    f_ev("CPI", 2027, 6, 10, 8, 30)
+    f_ev("NFP", 2027, 7, 2, 8, 30)
+    f_ev("CPI", 2027, 7, 14, 8, 30)
+    f_ev("FOMC", 2027, 7, 28, 14, 0)
+    f_ev("NFP", 2027, 8, 6, 8, 30)
+    f_ev("CPI", 2027, 8, 11, 8, 30)
+    f_ev("NFP", 2027, 9, 3, 8, 30)
+    f_ev("CPI", 2027, 9, 14, 8, 30)
+    f_ev("FOMC", 2027, 9, 15, 14, 0)
+    f_ev("NFP", 2027, 10, 8, 8, 30)
+    f_ev("CPI", 2027, 10, 14, 8, 30)
+    f_ev("NFP", 2027, 11, 5, 8, 30)
+    f_ev("CPI", 2027, 11, 10, 8, 30)
+    f_ev("FOMC", 2027, 11, 17, 14, 0)
+    f_ev("NFP", 2027, 12, 3, 8, 30)
+    f_ev("CPI", 2027, 12, 10, 8, 30)
+var int evI = 0
+while evI < evT.size()
+    if evT.get(evI) + iNewsPost * 60000 < time
+        evI += 1
+    else
+        break
+float  evMins = na
+string evName = ""
+if evI < evT.size()
+    evMins := (evT.get(evI) - time) / 60000.0
+    evName := evN.get(evI)
+calNear = iUseCal and not na(evMins) and evMins <= iNewsPre and evMins >= -iNewsPost
 
 // intraday volatility seasonality: EWMA of the squared 1-bar change per NY hour
 var array<float> hVar = array.new<float>(24, na)
@@ -590,12 +825,19 @@ type Cand
     float  adrR   = 0.0      // room left inside the daily range (−1…1)
     float  erA    = 0.0      // trend efficiency aligned with the target
     float  opp    = 0.0      // best model PoT on the opposite side (0-1)
+    float  rv     = 0.0      // FVG: relative volume of the displacement candle
+    float  obq    = 0.0      // order block quality 0-1
+    float  pathV  = 1.0      // volume profile between price and target (1 = average, <1 = LVN path)
+    float  lvlV   = 1.0      // volume profile at the target (>1 = HVN magnet)
+    float  fdiv   = 0.0      // order-flow divergence for the target direction (−1…1)
+    float  moA    = 0.0      // midnight-open position aligned with the target (+1 = from discount / premium)
+    float  emaA   = 0.0      // 1H EMA 50/200 trend aligned with the target
 
 f_edge(Cand c) =>
     c.dir == 1 ? c.btm : c.top
 
 // add with cross-timeframe arbitration (overlapping pools merge, higher tier wins)
-f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int tier, float depth, bool zone, float tol) =>
+f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int tier, float depth, bool zone, float tol, float rv = 0.0, float obq = 0.0) =>
     if not na(top) and not na(btm) and not na(t)
         int dir = btm > close ? 1 : top < close ? -1 : 0
         if dir != 0
@@ -615,10 +857,12 @@ f_add(array<Cand> cs, string name, string tf, float top, float btm, int t, int t
                             c.tier := tier
                             c.zone := zone
                         c.depth := math.max(c.depth, depth) + 5.0
+                        c.rv    := math.max(c.rv, rv)
+                        c.obq   := math.max(c.obq, obq)
                         done := true
                         break
             if not done
-                cs.push(Cand.new(name = name, tf = tf, top = top, btm = btm, t = t, dir = dir, tier = tier, depth = depth, zone = zone))
+                cs.push(Cand.new(name = name, tf = tf, top = top, btm = btm, t = t, dir = dir, tier = tier, depth = depth, zone = zone, rv = rv, obq = obq))
     cs
 
 f_fvgDepth(float top, float btm, float a) =>
@@ -637,6 +881,49 @@ doScore  = inLearn and (inRecent or bar_index % sampleEv == 0 or armDir != 0 or 
 tfAName = f_tfName(iTfA)
 tfBName = f_tfName(iTfB)
 sigH    = doScore ? f_horizonSigma() : 0.0
+
+// rolling volume profile (30 rows) of the last iVpBars chart bars
+f_profile(int n, int bins) =>
+    int   m  = math.max(1, math.min(n, bar_index + 1))
+    float lo = low
+    float hi = high
+    for i = 0 to m - 1
+        lo := math.min(lo, low[i])
+        hi := math.max(hi, high[i])
+    float step = math.max((hi - lo) / bins, syminfo.mintick)
+    array<float> pv = array.new<float>(bins, 0.0)
+    for i = 0 to m - 1
+        int b = math.min(bins - 1, math.max(0, int((hlc3[i] - lo) / step)))
+        pv.set(b, pv.get(b) + nz(volume[i], 1.0))
+    [pv, lo, step]
+
+array<float> vpArr  = array.new<float>()
+float        vpLo   = na
+float        vpStep = na
+float        vpMean = 0.0
+if doScore
+    [pv_, lo_, st_] = f_profile(iVpBars, 30)
+    vpArr  := pv_
+    vpLo   := lo_
+    vpStep := st_
+    vpMean := pv_.avg()
+
+f_vpBin(float price) =>
+    math.max(0, math.min(vpArr.size() - 1, int((price - vpLo) / vpStep)))
+// average traded volume between two prices (relative to the profile mean)
+f_vpPath(float p1, float p2) =>
+    int   b1 = f_vpBin(math.min(p1, p2))
+    int   b2 = f_vpBin(math.max(p1, p2))
+    float sm = 0.0
+    for b = b1 to b2
+        sm += vpArr.get(b)
+    vpMean > 0 ? sm / (b2 - b1 + 1) / vpMean : 1.0
+// volume at a price (0 outside the profile range)
+f_vpAt(float price) =>
+    float r = 0.0
+    if vpMean > 0 and price >= vpLo and price <= vpLo + vpStep * vpArr.size()
+        r := vpArr.get(f_vpBin(price)) / vpMean
+    r
 
 array<Cand> cs = array.new<Cand>()
 if doScore
@@ -667,9 +954,13 @@ if doScore
     if runLoA > aQlP
         f_add(cs, "EQL", tfAName, aQlP, aQlP, aQlT, 2, 13.0 + 5.0 * (aQlE - 1), false, tol)
     if runHiA < aUTop
-        f_add(cs, "SFVG", tfAName, aUTop, math.max(aUBtm, runHiA), aUT, 2, 3.0 + f_fvgDepth(aUTop, aUBtm, atrA), true, tol)
+        f_add(cs, "SFVG", tfAName, aUTop, math.max(aUBtm, runHiA), aUT, 2, 3.0 + f_fvgDepth(aUTop, aUBtm, atrA), true, tol, nz(aURV))
     if runLoA > aDBtm
-        f_add(cs, "BFVG", tfAName, math.min(aDTop, runLoA), aDBtm, aDT, 2, 3.0 + f_fvgDepth(aDTop, aDBtm, atrA), true, tol)
+        f_add(cs, "BFVG", tfAName, math.min(aDTop, runLoA), aDBtm, aDT, 2, 3.0 + f_fvgDepth(aDTop, aDBtm, atrA), true, tol, nz(aDRV))
+    if runHiA < aKUB
+        f_add(cs, aKUBr == 1 ? "BeBB" : "BeOB", tfAName, aKUT, aKUB, aKUTm, 2, 13.0 + 8.0 * nz(aKUQ), true, tol, 0.0, nz(aKUQ))
+    if runLoA > aKDT
+        f_add(cs, aKDBr == 1 ? "BuBB" : "BuOB", tfAName, aKDT, aKDB, aKDTm, 2, 13.0 + 8.0 * nz(aKDQ), true, tol, 0.0, nz(aKDQ))
     // engine B (minor)
     if runHiB < bBP
         f_add(cs, bBE >= 2 ? "EQH" : "BSL", tfBName, bBP, bBP, bBT, 1, 10.0 + 5.0 * (bBE - 1), false, tol)
@@ -680,9 +971,18 @@ if doScore
     if runLoB > bQlP
         f_add(cs, "EQL", tfBName, bQlP, bQlP, bQlT, 1, 10.0 + 5.0 * (bQlE - 1), false, tol)
     if runHiB < bUTop
-        f_add(cs, "SFVG", tfBName, bUTop, math.max(bUBtm, runHiB), bUT, 1, f_fvgDepth(bUTop, bUBtm, atrB), true, tol)
+        f_add(cs, "SFVG", tfBName, bUTop, math.max(bUBtm, runHiB), bUT, 1, f_fvgDepth(bUTop, bUBtm, atrB), true, tol, nz(bURV))
     if runLoB > bDBtm
-        f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol)
+        f_add(cs, "BFVG", tfBName, math.min(bDTop, runLoB), bDBtm, bDT, 1, f_fvgDepth(bDTop, bDBtm, atrB), true, tol, nz(bDRV))
+    if runHiB < bKUB
+        f_add(cs, bKUBr == 1 ? "BeBB" : "BeOB", tfBName, bKUT, bKUB, bKUTm, 1, 10.0 + 8.0 * nz(bKUQ), true, tol, 0.0, nz(bKUQ))
+    if runLoB > bKDT
+        f_add(cs, bKDBr == 1 ? "BuBB" : "BuOB", tfBName, bKDT, bKDB, bKDTm, 1, 10.0 + 8.0 * nz(bKDQ), true, tol, 0.0, nz(bKDQ))
+    // market opens
+    f_add(cs, "ORH", "SES", orH, orH, orHt, 2, 15.0, false, tol)
+    f_add(cs, "ORL", "SES", orL, orL, orLt, 2, 15.0, false, tol)
+    f_add(cs, "NDOG", "1D", ndT, ndB, ndTm, 2, 14.0, true, tol)
+    f_add(cs, "NWOG", "1W", nwT, nwB, nwTm, 3, 18.0, true, tol)
 
 // ──────────────────────────────────────────────── SELF-LEARNING MEMORY ──────
 // DOL samples by Confirmation level (<60, 60, 65, 70, 75, 80, 85, 90+)
@@ -700,9 +1000,12 @@ f_kB(float conv) =>
 // (weight 1 on its logit) and learns corrections from real outcomes.
 // features: bias · logit(model PoT) · confirmation · confirmations · distance ·
 //           ADR room · trend efficiency · liquidity line (vs FVG) · killzone · tier ·
-//           opposite-side pressure (best model PoT of the other direction)
-var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+//           opposite-side pressure (best model PoT of the other direction) ·
+//           FVG volume · OB quality · volume-profile path · volume at target ·
+//           order-flow divergence · midnight-open position · 1H EMA trend · news nearby
+NF = 19
+var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 var int aiN = 0        // resolved samples the AI has learned from
 f_sig(float z) =>
     1.0 / (1.0 + math.exp(-math.max(-30.0, math.min(30.0, z))))
@@ -710,10 +1013,11 @@ f_logit(float p) =>
     float q = math.max(0.02, math.min(0.98, p))
     math.log(q / (1.0 - q))
 f_feats(Cand c) =>
-    array.from(1.0, c.lp, c.conv / 100.0 - 0.7, c.confs / 8.0 - 0.5, c.dist / iMaxATR, c.adrR, c.erA, c.zone ? 0.0 : 1.0, inKZ ? 1.0 : 0.0, c.tier / 4.0, c.opp)
+    array.from(1.0, c.lp, c.conv / 100.0 - 0.7, c.confs / 8.0 - 0.5, c.dist / iMaxATR, c.adrR, c.erA, c.zone ? 0.0 : 1.0, inKZ ? 1.0 : 0.0, c.tier / 4.0, c.opp,
+         math.min(c.rv, 3.0) / 3.0, c.obq, math.min(c.pathV, 3.0) / 3.0, math.min(c.lvlV, 3.0) / 3.0, c.fdiv, c.moA, c.emaA, calNear ? 1.0 : 0.0)
 f_pred(array<float> x) =>
     float z = 0.0
-    for j = 0 to 10
+    for j = 0 to NF - 1
         z += W.get(j) * x.get(j)
     f_sig(z)
 // measured hit rate for Confirmation ≥ level bucket b
@@ -765,6 +1069,14 @@ if nC > 0
             float adrV = nz(adr10)
             c.adrR := adrV > 0 ? math.max(-1.0, math.min(1.0, c.dir == 1 ? (runLoD + adrV - edge) / adrV : (edge - (runHiD - adrV)) / adrV)) : 0.0
             c.erA  := er * (erDir == c.dir ? 1.0 : -1.0)
+            if vpArr.size() > 0
+                c.pathV := f_vpPath(close, edge)
+                c.lvlV  := f_vpAt(edge)
+            float bullF = divBull ? 1.0 : 0.0
+            float bearF = divBear ? 1.0 : 0.0
+            c.fdiv := c.dir == 1 ? bullF - bearF : bearF - bullF
+            c.moA  := na(mop) ? 0.0 : (close < mop ? 1.0 : -1.0) * c.dir
+            c.emaA := nz(aEmaT) * c.dir
             int cf = 0
             cf += biasA == c.dir ? 1 : 0
             cf += biasB == c.dir ? 1 : 0
@@ -812,7 +1124,7 @@ if iThrMode == "Auto (learned)" and n70 >= iMinSamples
 // quality gate (slack > 0 = looser rule used to KEEP an already active DOL)
 f_gate(Cand c, float slack) =>
     c.conv > 0 and c.conv >= effMinConv - slack and c.cpot >= iMinPoT - slack and c.confs >= iMinConfs - (slack > 0 ? 1 : 0) and
-         (not iUseADR or c.adrR >= (slack > 0 ? -0.1 : 0.0)) and (slack > 0 or c.dist >= iMinDist)
+         (not iUseADR or c.adrR >= (slack > 0 ? -0.1 : 0.0)) and (slack > 0 or c.dist >= iMinDist) and (slack > 0 or not calNear)
 
 var string primKey  = ""
 var float  primLvl  = na
@@ -878,15 +1190,15 @@ if barstate.isconfirmed and inLearn
                 if hit
                     kH.set(kb, kH.get(kb) + 1)
                 // SGD step, L2 pull toward the model prior
-                int   o = i * 11
+                int   o = i * NF
                 float z = 0.0
-                for j = 0 to 10
+                for j = 0 to NF - 1
                     z += W.get(j) * smX.get(o + j)
                 float err = (hit ? 1.0 : 0.0) - f_sig(z)
-                for j = 0 to 10
+                for j = 0 to NF - 1
                     W.set(j, W.get(j) + iLr * (err * smX.get(o + j) - 0.01 * (W.get(j) - W0.get(j))))
                 aiN += 1
-                for j = 0 to 10
+                for j = 0 to NF - 1
                     smX.remove(o)
                 smL.remove(i)
                 smD.remove(i)
@@ -1098,7 +1410,7 @@ if iShowSig and barstate.isconfirmed and inLearn
         bool mssOk  = na(armMss) ? true : armDir == -1 ? close < armMss : close > armMss
         bool modeOk = iSigMode == "Rejection" ? true : iSigMode == "Rejection + Displacement" ? dispOk : mssOk
         bool kzOk   = not iUseKZ or inKZ
-        bool newsOk = not iUseNews or not inNews
+        bool newsOk = (not iUseNews or not inNews) and not calNear and not inClose
         bool pdOk   = not iUsePD or armPD
         bool smtOk  = not smtOn or iSmtMode != "Required" or armSmt
         bool dolOk  = activeDir == armDir                       // active DOL agrees with the trade
@@ -1268,7 +1580,7 @@ if barstate.islast
             if c.zone
                 if iShowFvg
                     dBoxes.push(box.new(c.t, c.top, xL2, c.btm, xloc = xloc.bar_time, border_color = color.new(cAcc, 50), border_width = 1,
-                         bgcolor = color.new(cAcc, drawn.get(i) ? 86 : 90), text = c.name + " " + c.tf, text_size = size.tiny,
+                         bgcolor = color.new(cAcc, drawn.get(i) ? 86 : 90), text = c.name + " " + c.tf + (c.conv > 0 ? " · " + str.tostring(c.cpot, "#") + "%" : ""), text_size = size.tiny,
                          text_color = color.new(cAcc, 45), text_halign = text.align_right, text_valign = text.align_center,
                          text_font_family = font.family_monospace))
             else if iShowLevels and not drawn.get(i)
@@ -1276,6 +1588,12 @@ if barstate.islast
                 dLines.push(line.new(c.t, e, xL2, e, xloc = xloc.bar_time, color = color.new(cMute, 40), style = line.style_dotted, width = 1))
                 dLabels.push(label.new(xL2, e, c.name, xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR,
                      textcolor = color.new(cMute, 10), size = size.tiny, text_font_family = font.family_monospace))
+
+    // ── midnight (NY) open reference
+    if iShowLevels and not na(mop)
+        dLines.push(line.new(mopT, mop, xL2, mop, xloc = xloc.bar_time, color = color.new(cMute, 30), style = line.style_dashed, width = 1))
+        dLabels.push(label.new(xL2, mop, "MOP", xloc = xloc.bar_time, style = label.style_label_left, color = CLEAR,
+             textcolor = color.new(cMute, 10), size = size.tiny, text_font_family = font.family_monospace))
 
     // ── HUD
     if iShowHud
@@ -1314,7 +1632,10 @@ if barstate.islast
                 if c.tf == "SES" and c.dir == sDir and c.dist < sBest
                     sBest := c.dist
                     sTgt  := c.name
-        f_hud(6, "Session " + sesName, (sDir == 1 ? "▲ UP" : "▼ DOWN") + "  → " + sTgt, cMute, sDir == 1 ? cAcc : cBear, cBg)
+        if iUseCal and not na(evMins) and evMins <= 180 and evMins >= -iNewsPost
+            f_hud(6, "📰 " + evName, evMins >= 0 ? "in " + str.tostring(evMins, "#") + " min" : "live · wait", cBear, cBear, cRow)
+        else
+            f_hud(6, "Session " + sesName, (sDir == 1 ? "▲ UP" : "▼ DOWN") + "  → " + sTgt, cMute, sDir == 1 ? cAcc : cBear, cBg)
         f_hud(7, "Order Flow", (flowPct >= 50 ? "BUY " : "SELL ") + str.tostring(flowPct >= 50 ? flowPct : 100 - flowPct, "#") + "%",
              cMute, flowPct >= 55 ? cAcc : flowPct <= 45 ? cBear : cMute, cBg)
         f_hud(8, "TIMEFRAME BIAS", "", cMute, cMute, cRow)
