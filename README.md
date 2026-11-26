@@ -36,7 +36,10 @@ Preset **Auto**: el indicador reconoce el activo del gráfico y ajusta killzones
 El par SMT se puede cambiar en *Safety Filters*. Usa un símbolo con datos en tiempo real: los futuros CME sin suscripción llegan con 10 minutos de retraso. Si no hay datos del par, el SMT simplemente no suma.
 
 ### ⚡ Rendimiento
-- `calc_bars_count = 7000`: el indicador calcula solo las últimas ~7000 velas, unos 5 días en 1m.
+- `calc_bars_count = 5000`: el indicador calcula solo las últimas ~5000 velas, unos 3.5 días en 1m.
+- **Reloj de NY en minutos:** una sola lectura de hora por vela reemplaza las búsquedas de sesión (killzones, noticias, Asia/Londres/NY, Opening Range, cierre).
+- **Perfil de volumen en caché:** el rango sale de funciones nativas y el perfil se reconstruye cada 15 velas, no en cada una.
+- **IA sin listas temporales:** la predicción de cada candidato se calcula directamente, sin crear una lista nueva por candidato.
 - **Performance Mode** (por defecto **Fast**): funciona en todos los planes. El plan Basic tiene ~20 s de cálculo. *Balanced* y *Full* aprenden de más historia, pero necesitan un plan pago.
 - La volatilidad del PoT se calcula de forma incremental, con un solo cálculo de horario para killzones y otro para noticias.
 - SMT apagado por defecto, porque carga un segundo gráfico de 1m. Se activa en *Safety Filters*.
