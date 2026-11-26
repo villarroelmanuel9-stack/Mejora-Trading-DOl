@@ -53,6 +53,15 @@ El par SMT se puede cambiar en *Safety Filters*. Usa un símbolo con datos en ti
 
 Por defecto, el DOL aparece solo con **PoT AI ≥ 60%**, **≥ 5 de 8 confirmaciones**, **dentro del ADR** y con la confirmación por encima del umbral automático.
 
+### 📏 Cómo leer los números (importante)
+| En el panel | Qué es | Qué NO es |
+|---|---|---|
+| **Score ≥90 · 85/100** | Puntuación de cuántas condiciones se cumplen | No es una probabilidad de ganar |
+| **PoT AI 67%** | Probabilidad de que el precio **toque** el DOL en las próximas 120 velas. Mientras la IA tenga pocos datos dice `learning · n 14` | No dice si tu SL se toca antes |
+| **TP before SL ≈ 38%** (en la señal) / **My trade** | Probabilidad de tocar el **TP antes que el SL**, con la volatilidad y la deriva actuales. Sin deriva es SL ÷ (SL + TP): con un 2R gana ~33% de las veces por puro azar | No es una garantía |
+
+**📌 My Trade (manual):** activa *Analyze My Trade* y escribe tu entrada, SL y TP. El panel muestra `My trade ▲ · TP first 41% · RR 2.0`, o `TP reached` / `SL reached`.
+
 ### ⚠ Conflicto de dirección
 Si un objetivo **del lado contrario**, con confirmación ≥ 60 y a más de la distancia mínima, tiene **igual o más PoT AI** que el DOL activo:
 - La fila *Engines* del panel cambia a `⚠ CONFLICT ↓ BFVG 1H 85%`.

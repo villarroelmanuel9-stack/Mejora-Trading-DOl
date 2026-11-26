@@ -35,7 +35,8 @@ iEqTol  = input.float(0.10, "EQH / EQL Tolerance (× engine ATR)", minval = 0.01
 iFvgMin = input.float(0.25, "Min FVG Size (× engine ATR)", minval = 0.0, step = 0.05, group = grpE)
 
 grpQ = "🎯 Quality Gates"
-iMinConv   = input.int(80, "Min Confirmation to Show DOL (%)", minval = 0, maxval = 100, group = grpQ)
+iMinConv   = input.int(80, "Min Score to Show DOL (0-100)", minval = 0, maxval = 100, group = grpQ,
+     tooltip = "Score = how many conditions line up (depth, HTF bias, order flow, proximity, clear path). It is NOT a probability of winning.")
 iMinPoT    = input.float(60.0, "Min Probability (PoT AI) to Show DOL (%)", minval = 0.0, maxval = 95.0, step = 1.0, group = grpQ,
      tooltip = "Learned probability that price reaches the DOL within the PoT horizon. Higher = fewer but more accurate DOLs.")
 iHold      = input.int(10, "Hold Tolerance (points)", minval = 0, maxval = 30, group = grpQ,
@@ -115,6 +116,13 @@ iMinConfs    = input.int(5, "Min Confirmations (of 8)", minval = 0, maxval = 8, 
 iSigAdaptive = input.bool(true, "Hide Signal Setups with Negative Expectancy", group = grpL)
 iMinSigSamp  = input.int(8, "Min Signals per Setup", minval = 3, maxval = 100, group = grpL)
 iShowStats   = input.bool(true, "Self-Stats Rows in HUD", group = grpL)
+
+grpMy = "📌 My Trade (manual)"
+iMyOn    = input.bool(false, "Analyze My Trade", group = grpMy,
+     tooltip = "Type your entry, SL and TP (or click the price on the chart) to see the probability of hitting TP before SL, using the current volatility and drift.")
+iMyEntry = input.price(0.0, "Entry", group = grpMy)
+iMySL    = input.price(0.0, "Stop Loss", group = grpMy)
+iMyTP    = input.price(0.0, "Take Profit", group = grpMy)
 
 grpH = "📊 HUD"
 iShowHud = input.bool(true, "Show HUD", group = grpH)
@@ -544,6 +552,21 @@ f_pot(float dist, int dir, float sH) =>
         r := f_ncdf((-dist + m * iHorizon) / s) + math.exp(e) * f_ncdf((-dist - m * iHorizon) / s)
     math.min(95.0, 100.0 * math.min(1.0, r))
 
+// Probability that price moves +a (to TP) before −b (to SL). Without drift
+// this is b / (a + b): a 2R target only wins ~33 % of the time by chance.
+f_p2b(float a, float b, int dir) =>
+    float s2 = math.max(nz(sigma * sigma), 1e-12)
+    float m  = nz(mu) * dir
+    if iConsPoT
+        m := math.min(0.0, m)
+    float k  = 2.0 * m / s2
+    float r  = a + b > 0 ? b / (a + b) : 0.0
+    if a + b > 0 and math.abs(k * (a + b)) > 1e-6
+        float eb = math.exp(math.max(-50.0, math.min(50.0, k * b)))
+        float ea = math.exp(math.max(-50.0, math.min(50.0, -k * a)))
+        r := (eb - 1.0) / (eb - ea)
+    100.0 * math.max(0.0, math.min(1.0, r))
+
 atrRef = math.max(nz(atrB, ta.atr(14)), syminfo.mintick)
 
 // ──────────────────────────────────────────────────────────── CANDIDATES ────
@@ -680,6 +703,7 @@ f_kB(float conv) =>
 //           opposite-side pressure (best model PoT of the other direction)
 var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var int aiN = 0        // resolved samples the AI has learned from
 f_sig(float z) =>
     1.0 / (1.0 + math.exp(-math.max(-30.0, math.min(30.0, z))))
 f_logit(float p) =>
@@ -861,6 +885,7 @@ if barstate.isconfirmed and inLearn
                 float err = (hit ? 1.0 : 0.0) - f_sig(z)
                 for j = 0 to 10
                     W.set(j, W.get(j) + iLr * (err * smX.get(o + j) - 0.01 * (W.get(j) - W0.get(j))))
+                aiN += 1
                 for j = 0 to 10
                     smX.remove(o)
                 smL.remove(i)
@@ -1102,8 +1127,9 @@ if iShowSig and barstate.isconfirmed and inLearn
             evSell := sell and tShown
             evBuy  := not sell and tShown
             string hist = nCfg >= iMinSigSamp ? " · " + str.tostring(100.0 * gW.get(safety) / nCfg, "#") + "% hist" : ""
+            float  pTP = f_p2b(math.abs(activeLvl - close), risk, armDir)
             string txt = (sell ? "▼ SELL" : "▲ BUY") + "\n" + armName + " → " + cs.get(primI).name + " · RR " + str.tostring(rr, "#.0") +
-                 " · ★" + str.tostring(safety) + "/5" + hist
+                 " · ★" + str.tostring(safety) + "/5" + hist + "\nTP before SL ≈ " + str.tostring(pTP, "#") + "%"
             if tShown
                 tLbl := label.new(bar_index, sell ? high : low, txt, style = sell ? label.style_label_down : label.style_label_up,
                      color = cAcc, textcolor = #0B0A07, size = size.small, text_font_family = font.family_monospace)
@@ -1164,7 +1190,7 @@ if iShowMS and barstate.isconfirmed and inLearn
 var array<line>  dLines  = array.new<line>()
 var array<label> dLabels = array.new<label>()
 var array<box>   dBoxes  = array.new<box>()
-var table hud = table.new(f_pos(iHudPos), 2, 20, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
+var table hud = table.new(f_pos(iHudPos), 2, 21, bgcolor = cBg, border_color = #2A251B, border_width = 1, frame_color = #3A3122, frame_width = 1)
 
 f_hud(int r, string l, string v, color lc, color vc, color bg) =>
     table.cell(hud, 0, r, l, text_color = lc, text_halign = text.align_left, text_size = hudSize, bgcolor = bg, text_font_family = font.family_monospace)
@@ -1253,7 +1279,7 @@ if barstate.islast
 
     // ── HUD
     if iShowHud
-        table.clear(hud, 0, 0, 1, 19)
+        table.clear(hud, 0, 0, 1, 20)
         f_hud(0, "DOL ENGINE PRO", instName + " · " + f_tfName(timeframe.period), cAcc, cMute, cBg)
         int   si   = primI >= 0 ? primI : bestI
         bool  live = primI >= 0
@@ -1264,9 +1290,11 @@ if barstate.islast
             if live
                 f_hud(1, "◆ " + f_grade(s.conv) + "   " + s.name + " " + s.tf, str.tostring(edge, format.mintick), cAcc, cTxt, cRow)
             else
-                f_hud(1, "◇ WAITING ≥ " + str.tostring(effMinConv) + "%", "best " + s.name + " " + s.tf, cMute, cMute, cRow)
-            f_hud(2, "PoT AI " + str.tostring(iHorizon) + "b", f_bar(s.cpot) + " " + str.tostring(s.cpot, "#.0") + "%", cMute, vc, cBg)
-            f_hud(3, "Confirm ≥" + str.tostring(effMinConv) + " ✓" + str.tostring(s.confs) + "/8", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "%", cMute, vc, cBg)
+                f_hud(1, "◇ WAITING score ≥ " + str.tostring(effMinConv), "best " + s.name + " " + s.tf, cMute, cMute, cRow)
+            bool aiReady = aiN >= iMinSamples
+            f_hud(2, "PoT AI " + str.tostring(iHorizon) + "b", aiReady ? f_bar(s.cpot) + " " + str.tostring(s.cpot, "#.0") + "%" :
+                 "learning · n " + str.tostring(aiN) + " · ~" + str.tostring(s.cpot, "#") + "%", cMute, aiReady ? vc : cMute, cBg)
+            f_hud(3, "Score ≥" + str.tostring(effMinConv) + " ✓" + str.tostring(s.confs) + "/8", f_bar(s.conv) + " " + str.tostring(s.conv, "#") + "/100", cMute, vc, cBg)
             f_hud(4, "Distance", str.tostring(s.dist, "#.##") + " × " + tfBName + " ATR " + (s.dir == 1 ? "↑" : "↓"), cMute, vc, cBg)
         else
             f_hud(1, "◇ NO TARGET", "in range", cMute, cMute, cRow)
@@ -1320,6 +1348,14 @@ if barstate.islast
              cMute, dNew > 0 and 100.0 * dHit / dNew >= iTargetHit ? cAcc : cTxt, cRow)
         if timeframe.in_seconds(timeframe.period) > 60
             f_hud(19, "⚠ Chart TF", "built for 1m", cBear, cBear, cBg)
+        if iMyOn and iMyEntry > 0 and iMySL > 0 and iMyTP > 0 and iMySL != iMyTP
+            int   md    = iMyTP > iMySL ? 1 : -1
+            bool  tpHit = md == 1 ? close >= iMyTP : close <= iMyTP
+            bool  slHit = md == 1 ? close <= iMySL : close >= iMySL
+            float myRR  = math.abs(iMyTP - iMyEntry) / math.max(math.abs(iMyEntry - iMySL), syminfo.mintick)
+            float myP   = tpHit or slHit ? 0.0 : f_p2b(math.abs(iMyTP - close), math.abs(close - iMySL), md)
+            string mv   = tpHit ? "TP reached" : slHit ? "SL reached" : "TP first " + str.tostring(myP, "#") + "% · RR " + str.tostring(myRR, "#.0")
+            f_hud(20, "My trade " + (md == 1 ? "▲" : "▼"), mv, cTxt, tpHit or myP >= 50 ? cAcc : cBear, cRow)
 
 // ──────────────────────────────────────────────── ORDER-FLOW IMBALANCE ──────
 imbUp = iShowImb and barstate.isconfirmed and vol > 0 and rvol >= iImbRvol and delta / vol >= 0.5
@@ -1341,7 +1377,7 @@ alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure b
 if evNew and primI >= 0
     Cand p = cs.get(primI)
     alert("DOL Engine Pro · " + (p.dir == 1 ? "▲ " : "▼ ") + p.name + " " + p.tf + " @ " + str.tostring(f_edge(p), format.mintick) +
-         " · Confirmation " + str.tostring(p.conv, "#") + "% (" + str.tostring(p.confs) + "/8) · PoT AI " + str.tostring(p.cpot, "#.0") + "%", alert.freq_once_per_bar_close)
+         " · Score " + str.tostring(p.conv, "#") + "/100 (" + str.tostring(p.confs) + "/8) · PoT AI " + str.tostring(p.cpot, "#.0") + "%", alert.freq_once_per_bar_close)
 if evBuy or evSell
     alert("DOL Engine Pro · " + (evSell ? "SELL" : "BUY") + " " + syminfo.ticker + " @ " + str.tostring(sigEntry, format.mintick) +
          " · SL " + str.tostring(sigSL, format.mintick) + " · TP " + str.tostring(sigTP, format.mintick), alert.freq_once_per_bar_close)
