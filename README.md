@@ -53,6 +53,14 @@ El par SMT se puede cambiar en *Safety Filters*. Usa un símbolo con datos en ti
 
 Por defecto, el DOL aparece solo con **PoT AI ≥ 60%**, **≥ 5 de 8 confirmaciones**, **dentro del ADR** y con la confirmación por encima del umbral automático.
 
+### ⚠ Conflicto de dirección
+Si un objetivo **del lado contrario**, con confirmación ≥ 60 y a más de la distancia mínima, tiene **igual o más PoT AI** que el DOL activo:
+- La fila *Engines* del panel cambia a `⚠ CONFLICT ↓ BFVG 1H 85%`.
+- La línea del DOL se atenúa y su etiqueta muestra `⚠`.
+- Se **bloquean las señales** BUY/SELL en la dirección del DOL mientras dure el conflicto.
+- Hay una alerta *DOL conflict*.
+- La IA aprende de esto: la probabilidad del lado contrario es su 11.º dato.
+
 ### 🧠 Auto-aprendizaje (retroalimentación)
 El indicador **mide sus propios resultados en tu gráfico** (por defecto, las últimas 4000 velas) y se calibra solo:
 

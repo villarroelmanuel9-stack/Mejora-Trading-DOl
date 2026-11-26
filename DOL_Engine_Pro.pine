@@ -44,6 +44,10 @@ iSwitch    = input.int(10, "Switch Margin (points)", minval = 0, maxval = 50, gr
      tooltip = "A new target replaces the active DOL only if its probability is higher by at least this margin.")
 iMinDist   = input.float(0.5, "Min Distance to Activate (× Engine B ATR)", minval = 0.0, step = 0.1, group = grpQ,
      tooltip = "A target already on top of price is not activated (it inflates the hit rate and gives no trade). An active DOL is kept until it is reached.")
+iConflict  = input.bool(true, "Conflict Warning", group = grpQ,
+     tooltip = "Warns when a target on the OPPOSITE side is at least as probable as the active DOL, and blocks entry signals in the DOL direction while it lasts.")
+iConfMarg  = input.int(0, "Conflict Margin (points)", minval = 0, maxval = 30, group = grpQ,
+     tooltip = "0 = conflict when the opposite target is equally or more probable. Higher = only when it is clearly more probable.")
 iUseADR    = input.bool(true, "ADR Reachability Filter", group = grpQ,
      tooltip = "Hide targets that would need more than a normal daily range (10-day ADR) to be reached today.")
 iMaxATR    = input.float(12.0, "Max Distance (× Engine B ATR)", minval = 1.0, step = 0.5, group = grpQ)
@@ -562,6 +566,7 @@ type Cand
     float  lp     = 0.0      // logit of the model PoT
     float  adrR   = 0.0      // room left inside the daily range (−1…1)
     float  erA    = 0.0      // trend efficiency aligned with the target
+    float  opp    = 0.0      // best model PoT on the opposite side (0-1)
 
 f_edge(Cand c) =>
     c.dir == 1 ? c.btm : c.top
@@ -671,19 +676,20 @@ f_kB(float conv) =>
 // PoT AI — online logistic regression (SGD). Starts equal to the model PoT
 // (weight 1 on its logit) and learns corrections from real outcomes.
 // features: bias · logit(model PoT) · confirmation · confirmations · distance ·
-//           ADR room · trend efficiency · liquidity line (vs FVG) · killzone · tier
-var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+//           ADR room · trend efficiency · liquidity line (vs FVG) · killzone · tier ·
+//           opposite-side pressure (best model PoT of the other direction)
+var array<float> W  = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var array<float> W0 = array.from(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 f_sig(float z) =>
     1.0 / (1.0 + math.exp(-math.max(-30.0, math.min(30.0, z))))
 f_logit(float p) =>
     float q = math.max(0.02, math.min(0.98, p))
     math.log(q / (1.0 - q))
 f_feats(Cand c) =>
-    array.from(1.0, c.lp, c.conv / 100.0 - 0.7, c.confs / 8.0 - 0.5, c.dist / iMaxATR, c.adrR, c.erA, c.zone ? 0.0 : 1.0, inKZ ? 1.0 : 0.0, c.tier / 4.0)
+    array.from(1.0, c.lp, c.conv / 100.0 - 0.7, c.confs / 8.0 - 0.5, c.dist / iMaxATR, c.adrR, c.erA, c.zone ? 0.0 : 1.0, inKZ ? 1.0 : 0.0, c.tier / 4.0, c.opp)
 f_pred(array<float> x) =>
     float z = 0.0
-    for j = 0 to 9
+    for j = 0 to 10
         z += W.get(j) * x.get(j)
     f_sig(z)
 // measured hit rate for Confirmation ≥ level bucket b
@@ -745,8 +751,24 @@ if nC > 0
             cf += inKZ ? 1 : 0
             cf += c.adrR >= 0 ? 1 : 0
             c.confs := cf
-            c.cpot  := math.min(95.0, 100.0 * f_pred(f_feats(c)))
         convs.push(c.conv)
+
+// opposite-side pressure, then PoT AI
+float mxUp = 0.0
+float mxDn = 0.0
+if nC > 0
+    for i = 0 to nC - 1
+        Cand c = cs.get(i)
+        if c.conv > 0 and c.dist >= iMinDist
+            if c.dir == 1
+                mxUp := math.max(mxUp, c.pot)
+            else
+                mxDn := math.max(mxDn, c.pot)
+    for i = 0 to nC - 1
+        Cand c = cs.get(i)
+        if c.conv > 0
+            c.opp  := (c.dir == 1 ? mxDn : mxUp) / 100.0
+            c.cpot := math.min(95.0, 100.0 * f_pred(f_feats(c)))
 
 array<int> rankIdx = nC > 0 ? convs.sort_indices(order.descending) : array.new<int>()
 
@@ -798,6 +820,24 @@ if nC > 0
         if not better
             primI := curI
 
+// ⚠ conflict: a meaningful target on the opposite side is at least as probable
+bool conflict = false
+int  oppI     = -1
+if iConflict and primI >= 0
+    Cand  pc      = cs.get(primI)
+    float bestOpp = -1.0
+    for i = 0 to nC - 1
+        Cand c = cs.get(i)
+        if c.dir == -pc.dir and c.conv >= 60 and c.dist >= iMinDist and c.cpot > bestOpp
+            bestOpp := c.cpot
+            oppI    := i
+    conflict := oppI >= 0 and bestOpp >= pc.cpot + iConfMarg
+var bool wasConflict = false
+bool evConflict = false
+if barstate.isconfirmed and doScore
+    evConflict  := conflict and not wasConflict
+    wasConflict := conflict
+
 // ─────────────────────────────────────── DOL SAMPLING (learn hit rates) ─────
 var array<float> smL = array.new<float>()
 var array<int>   smD = array.new<int>()
@@ -814,14 +854,14 @@ if barstate.isconfirmed and inLearn
                 if hit
                     kH.set(kb, kH.get(kb) + 1)
                 // SGD step, L2 pull toward the model prior
-                int   o = i * 10
+                int   o = i * 11
                 float z = 0.0
-                for j = 0 to 9
+                for j = 0 to 10
                     z += W.get(j) * smX.get(o + j)
                 float err = (hit ? 1.0 : 0.0) - f_sig(z)
-                for j = 0 to 9
+                for j = 0 to 10
                     W.set(j, W.get(j) + iLr * (err * smX.get(o + j) - 0.01 * (W.get(j) - W0.get(j))))
-                for j = 0 to 9
+                for j = 0 to 10
                     smX.remove(o)
                 smL.remove(i)
                 smD.remove(i)
@@ -1042,7 +1082,7 @@ if iShowSig and barstate.isconfirmed and inLearn
         float risk  = math.abs(close - slP)
         float rr    = risk > 0 and not na(activeLvl) ? math.abs(activeLvl - close) / risk : 0.0
         bool rrOk   = rr >= iMinRR
-        if candle and modeOk and kzOk and newsOk and pdOk and smtOk and dolOk and rrOk
+        if candle and modeOk and kzOk and newsOk and pdOk and smtOk and dolOk and rrOk and not conflict
             bool sell = armDir == -1
             tDir   := armDir
             tEntry := close
@@ -1154,13 +1194,13 @@ if barstate.islast
         float bBtm = p.zone ? p.btm - band * 0.5 : edge - band
         dBoxes.push(box.new(p.t, bTop, xR, bBtm, xloc = xloc.bar_time, border_color = color.new(cAcc, 45), border_style = line.style_dashed,
              border_width = 1, bgcolor = color.new(cAcc, 90)))
-        dLines.push(line.new(p.t, edge, xR, edge, xloc = xloc.bar_time, color = cAcc, width = 3))
+        dLines.push(line.new(p.t, edge, xR, edge, xloc = xloc.bar_time, color = conflict ? color.new(cAcc, 55) : cAcc, width = 3))
         dLines.push(line.new(time, close, xR, edge, xloc = xloc.bar_time, color = color.new(cAcc, 35), style = line.style_dotted, width = 1))
         int bars = int((time - p.t) / tms)
         dLabels.push(label.new(int(p.t + (xR - p.t) / 2), edge, "1. " + p.name + " · " + str.tostring(bars) + " bars", xloc = xloc.bar_time,
              style = label.style_label_center, color = cBg, textcolor = color.new(cAcc, 25), size = size.tiny, text_font_family = font.family_monospace))
         dLabels.push(label.new(xR, edge, "◆ " + f_grade(p.conv) + "  " + p.name + (p.merged > 0 ? "  ⊕" + str.tostring(p.merged) : "") + "\n" +
-             p.tf + "  " + str.tostring(p.cpot, "#.0") + "%  ✓" + str.tostring(p.confs) + "/8", xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
+             p.tf + "  " + str.tostring(p.cpot, "#.0") + "%  ✓" + str.tostring(p.confs) + "/8" + (conflict ? "  ⚠" : ""), xloc = xloc.bar_time, style = label.style_label_left, color = cRow,
              textcolor = cAcc, size = size.small, textalign = text.align_left, text_font_family = font.family_monospace))
 
     // ── candidate ladder (runner-ups)
@@ -1230,7 +1270,11 @@ if barstate.islast
             f_hud(4, "Distance", str.tostring(s.dist, "#.##") + " × " + tfBName + " ATR " + (s.dir == 1 ? "↑" : "↓"), cMute, vc, cBg)
         else
             f_hud(1, "◇ NO TARGET", "in range", cMute, cMute, cRow)
-        f_hud(5, "Engines", tfAName + " · " + tfBName, cMute, cMute, cBg)
+        if conflict and oppI >= 0
+            Cand oc = cs.get(oppI)
+            f_hud(5, "⚠ CONFLICT", (oc.dir == 1 ? "↑ " : "↓ ") + oc.name + " " + oc.tf + " " + str.tostring(oc.cpot, "#") + "%", cBear, cBear, cRow)
+        else
+            f_hud(5, "Engines", tfAName + " · " + tfBName, cMute, cMute, cBg)
         // session flow
         string sesName = inAsia ? "ASIA" : inLon ? "LON" : inNy ? "NY" : "—"
         int    sDir    = close >= nz(dayOpen, close) ? 1 : -1
@@ -1291,6 +1335,7 @@ alertcondition(evSell,  "SELL at DOL",            "DOL Engine Pro · SELL after 
 alertcondition(evTP,    "Signal TP (DOL reached)", "DOL Engine Pro · signal reached its DOL target on {{ticker}}")
 alertcondition(evSL,    "Signal SL hit",          "DOL Engine Pro · signal stopped out on {{ticker}}")
 alertcondition(evInval, "Signal invalidated",     "DOL Engine Pro · DOL flipped against the open signal on {{ticker}}")
+alertcondition(evConflict, "DOL conflict",        "DOL Engine Pro · opposite target is now more probable than the active DOL on {{ticker}}")
 alertcondition(evMS,    "BOS / MSS",              "DOL Engine Pro · structure break on {{ticker}}")
 
 if evNew and primI >= 0
