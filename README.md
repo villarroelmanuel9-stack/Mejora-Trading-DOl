@@ -234,3 +234,9 @@ Copia del proyecto open source [ariadng/metatrader-mcp-server](https://github.co
 5. **Reinicia Claude Desktop** y pregunta: *"Muéstrame mi cuenta y mis posiciones abiertas"*.
 
 ⚠️ No agregues `--allow-trading` salvo que realmente quieras que Claude pueda operar, y en ese caso prueba primero en una **cuenta demo**.
+
+
+---
+
+## 💼 Capital.com → Claude (carpeta `capital-mcp/`)
+Conector **de solo lectura** para ver tu cuenta de **Capital.com** desde Claude Desktop (saldo, posiciones, órdenes, historial y precios) usando la API oficial de Capital.com. **No necesita MetaTrader 5 ni Windows**: funciona en cualquier computadora con Claude Desktop. Instrucciones en [`capital-mcp/README.md`](./capital-mcp/README.md).

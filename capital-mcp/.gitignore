@@ -1,0 +1,4 @@
+# credentials stay on your computer only
+.env
+__pycache__/
+.pytest_cache/
